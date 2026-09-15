@@ -1,4 +1,5 @@
 import {
+  INSTALL_CONVERSION_DAYS,
   STATS_RANGES,
   type StatsBreakdownItem,
   type StatsRange,
@@ -6,6 +7,19 @@ import {
   type StatsSeriesPoint,
   type StatsSnapshot,
 } from "../shared/stats";
+import { peopleCountedSince } from "../shared/stats-snapshot";
+import {
+  deltaChip,
+  formatDuration,
+  formatPercent,
+  funnelInsight,
+  humanize,
+  integerFormatter,
+  numberFormatter,
+  ratio,
+  sessionsInsight,
+  trafficInsight,
+} from "../shared/stats-copy";
 import { RELEASE_CHECKSUMS_PATH, RELEASE_VERSION } from "../shared/release";
 import "./stats.css";
 
@@ -25,8 +39,6 @@ const ACTIVITY_SERIES: ChartSeries[] = [
 const TRAFFIC_SERIES: ChartSeries[] = [
   { key: "pageViews", label: "Page views", color: "#9ab7e8" },
 ];
-const numberFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
-const integerFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 let activeDashboardCleanup: (() => void) | null = null;
 let statsRenderId = 0;
 
@@ -206,6 +218,7 @@ function renderAuthenticatedDashboard(root: HTMLElement): () => void {
           <div>
             <span class="stats-eyebrow">Aggregate product signal</span>
             <h1>What shell.online<br>is doing.</h1>
+            <p id="stats-live" class="stats-live">Checking what is live…</p>
           </div>
           <div class="stats-freshness">
             <span id="stats-state"><i></i> Loading live metrics</span>
@@ -327,16 +340,45 @@ function renderAuthenticatedDashboard(root: HTMLElement): () => void {
 
 function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
   const metrics = snapshot.metrics;
+  const figures = snapshot.figures;
+  const audiences = snapshot.audiences;
+  const previous = snapshot.previous;
   const rangeLabel = snapshot.range === "all" ? "all time" : `last ${snapshot.range}`;
+  const priorLabel = snapshot.range === "all" ? "" : `the ${snapshot.range} before`;
   const outcomes = snapshot.breakdowns.outcomes;
   const endedSessions = outcomes.reduce((sum, item) => sum + item.value, 0);
   const people = snapshot.uniques;
   const site = people.surfaces.site;
   const cli = people.surfaces.cli;
+  /*
+   * People are counted from the day the salt was set, events from the first
+   * event. A people figure over fewer days than the count beside it says so,
+   * or thirty days of views next to one day of people reads as nonsense.
+   */
+  const peopleSince = peopleCountedSince(people, snapshot.rangeStart);
+  /* Plain text: renderKpi escapes its detail. */
+  const sinceNote = peopleSince === null ? "" : ` · counted since ${formatDay(peopleSince)}`;
+  const totalViews = metrics.landingViews + metrics.docsViews;
+  const otherViews = audiences.views.tools + audiences.views.unknown;
   const ctaByLink = snapshot.targets
     .filter((metric) => metric.event === "cta_click")
     .map((metric) => ({ label: metric.target, value: metric.count }))
     .sort((left, right) => right.value - left.value);
+  const installsByPlatform = snapshot.targets
+    .filter((metric) => metric.event === "binary_download")
+    .map((metric) => ({ label: metric.target, value: metric.count }))
+    .sort((left, right) => right.value - left.value);
+  const installerAudience = [
+    { label: "Piped to a shell (curl, wget)", value: audiences.installer.tools },
+    { label: "Read in a browser", value: audiences.installer.browsers },
+    { label: "Fetched by crawlers", value: audiences.installer.crawlers },
+    { label: "No user agent", value: audiences.installer.unknown },
+  ].filter((item) => item.value > 0);
+  const delta = (current: number, before: number | null | undefined): string =>
+    renderDelta(current, before ?? null, priorLabel);
+
+  renderLive(metrics);
+
   container.innerHTML = `
     ${people.configured ? "" : `
       <p class="stats-note">
@@ -346,60 +388,70 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
     `}
     <section class="stats-kpis" aria-label="Headline statistics">
       ${renderKpi(
-        "Active now",
-        metrics.activeSessions,
-        `${integerFormatter.format(metrics.activeViewers)} viewer${metrics.activeViewers === 1 ? "" : "s"} connected now`,
-        snapshot.trend,
-        "sessions",
-        "blue",
-      )}
-      ${renderKpi(
-        "Unique visitors",
+        "Visitors",
         people.configured ? site.unique : "—",
         people.configured
-          ? `${integerFormatter.format(site.new)} new · ${integerFormatter.format(site.returning)} returning`
-          : `${integerFormatter.format(metrics.landingViews)} landing views, people not counted`,
+          ? `${integerFormatter.format(site.new)} new · ${integerFormatter.format(site.returning)} returning${sinceNote}`
+          : "people are not counted yet",
         snapshot.trend,
         "pageViews",
         "silver",
+        people.configured ? delta(site.unique, previous?.people?.site) : "",
+      )}
+      ${renderKpi(
+        "Views by people",
+        figures.siteViews,
+        figures.crawlerViews === 0
+          ? "no crawler views in this range"
+          : `${integerFormatter.format(figures.crawlerViews)} more by crawlers, kept out`,
+        snapshot.trend,
+        "pageViews",
+        "blue",
+        delta(figures.siteViews, previous?.figures.siteViews),
       )}
       ${renderKpi(
         "Installs completed",
-        metrics.binaryDownloads,
-        `${integerFormatter.format(metrics.installs)} installer fetch${metrics.installs === 1 ? "" : "es"}`,
+        figures.installs,
+        figures.installerRuns === 0
+          ? "no installer runs in this range"
+          : `${formatPercent(ratio(figures.installs, figures.installerRuns))} of ${integerFormatter.format(figures.installerRuns)} installer run${figures.installerRuns === 1 ? "" : "s"}`,
         snapshot.trend,
         "sessions",
         "amber",
+        delta(figures.installs, previous?.figures.installs),
       )}
       ${renderKpi(
         "Sessions started",
-        metrics.sessionsStarted,
+        figures.sessionsStarted,
         people.configured
-          ? `from ${integerFormatter.format(cli.unique)} machine${cli.unique === 1 ? "" : "s"}, ${integerFormatter.format(cli.new)} new`
+          ? `on ${integerFormatter.format(cli.unique)} machine${cli.unique === 1 ? "" : "s"}, ${integerFormatter.format(cli.new)} new${sinceNote}`
           : `${integerFormatter.format(metrics.sessionsCreated)} created`,
         snapshot.trend,
         "sessions",
         "violet",
+        delta(figures.sessionsStarted, previous?.figures.sessionsStarted),
       )}
       ${renderKpi(
         "Opened in a browser",
-        metrics.sharesOpened,
-        metrics.sessionsStarted === 0
-          ? "No sessions in this range"
-          : `${formatPercent(ratio(metrics.sharesOpened, metrics.sessionsStarted))} of sessions started`,
+        figures.sharesOpened,
+        figures.sessionsStarted === 0
+          ? "no sessions in this range"
+          : `${formatPercent(ratio(figures.sharesOpened, figures.sessionsStarted))} of sessions started`,
         snapshot.trend,
         "shares",
         "green",
+        delta(figures.sharesOpened, previous?.figures.sharesOpened),
       )}
       ${renderKpi(
         "Typed from a browser",
-        metrics.collaborations,
-        metrics.sharesOpened === 0
-          ? "No opened sessions yet"
-          : `${formatPercent(ratio(metrics.collaborations, metrics.sharesOpened))} of opened sessions`,
+        figures.collaborations,
+        figures.sharesOpened === 0
+          ? "no opened sessions yet"
+          : `${formatPercent(ratio(figures.collaborations, figures.sharesOpened))} of opened sessions`,
         snapshot.trend,
         "collaborations",
         "pink",
+        delta(figures.collaborations, previous?.figures.collaborations),
       )}
     </section>
 
@@ -408,9 +460,52 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
         <div><span class="panel-kicker">From a first look to a first keystroke</span><h2>Funnel</h2></div>
         <span class="panel-range">${escapeHtml(rangeLabel)}</span>
       </header>
-      ${renderFunnel(snapshot)}
+      <p class="panel-insight">${escapeHtml(funnelInsight(snapshot))}</p>
+      ${renderFunnel(snapshot, peopleSince)}
+      ${peopleSince === null ? "" : `<p class="cohort-empty">People have been counted since ${escapeHtml(formatDay(peopleSince))}; event counts run from the start of the range. Until the range begins after that day, a people figure covers fewer days than the count beside it.</p>`}
+      ${renderInstallConversion(snapshot)}
       ${renderUniquesStrip(snapshot)}
     </article>
+
+    <section class="stats-wide-grid">
+      <article class="stats-panel traffic-panel">
+        <header class="panel-heading">
+          <div><span class="panel-kicker">Who came</span><h2>Traffic</h2></div>
+          <strong>${integerFormatter.format(totalViews)} <small>views</small></strong>
+        </header>
+        <p class="panel-insight">${escapeHtml(trafficInsight(snapshot))}</p>
+        ${renderTimeChart("traffic", snapshot.trend, TRAFFIC_SERIES, snapshot.range, true)}
+        <div class="traffic-split is-wide">
+          <span class="split-people"><i></i>People <b>${integerFormatter.format(audiences.views.browsers)}</b></span>
+          <span class="split-crawlers"><i></i>Crawlers <b>${integerFormatter.format(audiences.views.crawlers)}</b></span>
+          <span class="split-tools"><i></i>Tools <b>${integerFormatter.format(otherViews)}</b></span>
+          <span class="split-page"><i></i>Landing <b>${integerFormatter.format(metrics.landingViews)}</b></span>
+          <span class="split-page"><i></i>Docs <b>${integerFormatter.format(metrics.docsViews)}</b></span>
+          <span class="split-page"><i></i>Shared terminals <b>${integerFormatter.format(metrics.terminalViews)}</b></span>
+          <span class="split-page"><i></i>Unknown paths <b>${integerFormatter.format(metrics.unknownPaths)}</b></span>
+          <span class="split-page"><i></i>404s <b>${integerFormatter.format(metrics.notFoundViews)}</b></span>
+        </div>
+      </article>
+      ${renderBreakdown(
+        "Sources",
+        "Where landing visits came from",
+        snapshot.breakdowns.referrers,
+        "referrer",
+        "Landing page only. Most browsers send no referrer, so Direct is also everyone they hid.",
+      )}
+    </section>
+
+    <section class="stats-breakdown-grid">
+      ${renderBreakdown("Pages", "Document views by page, every audience", snapshot.breakdowns.pages, "page")}
+      ${renderBreakdown("Devices", "Page views by device class", snapshot.breakdowns.devices, "device")}
+      ${renderBreakdown(
+        "Sign-up clicks",
+        "Which landing link was clicked",
+        ctaByLink,
+        "cta",
+        "Accounts also start in the app, from an invite, or from the CLI, none of which pass here.",
+      )}
+    </section>
 
     <section class="stats-wide-grid">
       <article class="stats-panel activity-panel">
@@ -420,6 +515,7 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
             ${ACTIVITY_SERIES.map((series) => `<span><i style="--legend:${series.color}"></i>${series.label}</span>`).join("")}
           </div>
         </header>
+        <p class="panel-insight">${escapeHtml(sessionsInsight(snapshot))}</p>
         ${renderTimeChart("activity", snapshot.trend, ACTIVITY_SERIES, snapshot.range)}
       </article>
 
@@ -434,8 +530,62 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
           <span><small>Longest lifetime</small><b>${formatDuration(metrics.longestDurationSeconds)}</b></span>
           <span><small>Avg peak audience</small><b>${numberFormatter.format(metrics.averagePeakViewers)}</b></span>
           <span><small>Largest audience</small><b>${integerFormatter.format(metrics.maximumPeakViewers)}</b></span>
+          <span><small>Link waited for its first open</small><b>${metrics.sharesOpened === 0 ? "—" : formatDuration(metrics.averageSecondsToOpen)}</b></span>
+          <span><small>Open to first keystroke</small><b>${metrics.collaborations === 0 ? "—" : formatDuration(metrics.averageSecondsToType)}</b></span>
+          <span><small>A viewer stayed</small><b>${metrics.averageViewerSeconds === 0 ? "—" : formatDuration(metrics.averageViewerSeconds)}</b></span>
+          <span><small>Viewers turned away</small><b>${integerFormatter.format(metrics.viewersRejected)}</b></span>
         </div>
       </article>
+    </section>
+
+    <section class="stats-breakdown-grid">
+      ${renderBreakdown("CLI clients", "Versions creating sessions", snapshot.breakdowns.clients, "client")}
+      ${renderRates(
+        "Typed, by device",
+        "Of sessions opened on each device class, how many were typed into",
+        snapshot.breakdowns.openedDevices.map((opened) => ({
+          label: opened.label,
+          numerator: snapshot.breakdowns.typedDevices.find((typed) => typed.label === opened.label)?.value ?? 0,
+          denominator: opened.value,
+        })),
+        "Device is the first viewer's for opened and the first typist's for typed, so a phone that watched while a laptop typed lands on both sides.",
+      )}
+      ${renderBreakdown(
+        "Turned away",
+        "Browsers that opened a link and got nothing",
+        [
+          ...snapshot.breakdowns.rejections,
+          ...(metrics.inputDenied > 0 ? [{ label: "typed_into_read_only", value: metrics.inputDenied }] : []),
+        ],
+        "rejection",
+        "A full, expired or unknown session closes the link at once; typing into a read-only session is refused but the viewer stays. None of these appear as opened.",
+      )}
+    </section>
+
+    <section class="stats-breakdown-grid">
+      ${renderBreakdown(
+        "Installer",
+        "Who fetched the install script",
+        installerAudience,
+        "download",
+        metrics.skillDownloads === 0
+          ? "Only a fetch by curl or wget counts as a run."
+          : `Only a fetch by curl or wget counts as a run. The agent skill file was fetched ${integerFormatter.format(metrics.skillDownloads)} time${metrics.skillDownloads === 1 ? "" : "s"}.`,
+      )}
+      ${renderBreakdown(
+        "Installs by platform",
+        "Release binaries served",
+        installsByPlatform,
+        "download",
+        "Homebrew and source builds are not counted.",
+      )}
+      ${renderBreakdown(
+        "Installer outcomes",
+        "How installs ended, by the script's own account",
+        snapshot.breakdowns.installOutcomes,
+        "outcome",
+        "One word sent by the installer at its end, unless SHELL_ONLINE_INSTALL_REPORT=0 was set. A machine that never reached the end of the script reports nothing.",
+      )}
     </section>
 
     <section class="stats-people-grid">
@@ -459,32 +609,8 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
 
     ${renderAccounts(snapshot)}
 
-    <article class="stats-panel traffic-panel">
-      <header class="panel-heading">
-        <div><span class="panel-kicker">Attention</span><h2>Traffic pulse</h2></div>
-        <strong>${integerFormatter.format(metrics.landingViews + metrics.docsViews + metrics.terminalViews)} <small>views</small></strong>
-      </header>
-      ${renderTimeChart("traffic", snapshot.trend, TRAFFIC_SERIES, snapshot.range, true)}
-      <div class="traffic-split is-wide">
-        <span><i></i>Landing <b>${integerFormatter.format(metrics.landingViews)}</b></span>
-        <span><i></i>Docs <b>${integerFormatter.format(metrics.docsViews)}</b></span>
-        <span><i></i>Shared terminals <b>${integerFormatter.format(metrics.terminalViews)}</b></span>
-        <span><i></i>Unknown paths <b>${integerFormatter.format(metrics.unknownPaths)}</b></span>
-        <span><i></i>404s <b>${integerFormatter.format(metrics.notFoundViews)}</b></span>
-      </div>
-    </article>
-
-    <section class="stats-breakdown-grid">
-      ${renderBreakdown("Acquisition", "Where landing visits came from", snapshot.breakdowns.referrers, "referrer")}
-      ${renderBreakdown("Pages", "Document views by page", snapshot.breakdowns.pages, "page")}
-      ${renderBreakdown("Sign-up clicks", "Which link was clicked", ctaByLink, "cta")}
-      ${renderBreakdown("Devices", "Browsers opening shell.online", snapshot.breakdowns.devices, "device")}
-      ${renderBreakdown("CLI clients", "Versions creating sessions", snapshot.breakdowns.clients, "client")}
-      ${renderBreakdown("Delivery", "Installer, skill and binary requests", snapshot.breakdowns.downloads, "download")}
-    </section>
-
     <details class="stats-panel raw-metrics">
-      <summary><span><small>Complete event ledger</small>Every tracked aggregate</span><i></i></summary>
+      <summary><span><small>Complete event ledger</small>Every tracked aggregate, every audience</span><i></i></summary>
       <div class="metrics-table-wrap">
         <table>
           <thead><tr><th>Event</th><th>Target</th><th>Count</th><th>Value sum</th><th>Maximum</th></tr></thead>
@@ -504,14 +630,34 @@ function renderSnapshot(container: HTMLElement, snapshot: StatsSnapshot): void {
     </details>
 
     <div class="collection-note">
-      <span>Showing ${escapeHtml(rangeLabel)}.</span>
+      <span>Showing ${escapeHtml(rangeLabel)}${previous ? `, compared with ${escapeHtml(priorLabel)}` : ""}.</span>
       <span>${snapshot.collectingSince ? `Collecting exact dashboard metrics since ${formatDate(snapshot.collectingSince)}.` : "Waiting for the first event."}</span>
+      ${people.configured && people.since !== null ? `<span>Counting people since ${escapeHtml(formatDay(people.since, "long"))}.</span>` : ""}
+      <span>Crawlers are requests whose user agent says so; they stay in the ledger and out of every figure about people.</span>
       <span>People are keyed hashes of address and browser family, forgotten ${people.memoryDays} days after they were last seen; a person seen again after that counts as new.</span>
     </div>
   `;
 
   bindChartInteraction(container.querySelector("#activity-chart"), snapshot.trend, ACTIVITY_SERIES);
   bindChartInteraction(container.querySelector("#traffic-chart"), snapshot.trend, TRAFFIC_SERIES);
+}
+
+/** What is happening this minute, under the page title, so it is not mistaken for a range figure. */
+function renderLive(metrics: StatsSnapshot["metrics"]): void {
+  const live = document.getElementById("stats-live");
+  if (!live) return;
+  if (metrics.activeSessions === 0 && metrics.activeViewers === 0) {
+    live.textContent = "Nothing is live right now.";
+    return;
+  }
+  live.innerHTML = `Live now: <b>${integerFormatter.format(metrics.activeSessions)}</b> session${metrics.activeSessions === 1 ? "" : "s"}, <b>${integerFormatter.format(metrics.activeViewers)}</b> viewer${metrics.activeViewers === 1 ? "" : "s"} connected.`;
+}
+
+/** The chip beside a headline figure: how it moved against the period before, or nothing. */
+function renderDelta(current: number, before: number | null, priorLabel: string): string {
+  const chip = deltaChip(current, before, priorLabel);
+  if (chip === null) return "";
+  return `<em class="kpi-delta ${chip.tone}" title="${escapeHtml(chip.title)}">${chip.text}</em>`;
 }
 
 function renderKpi(
@@ -521,10 +667,11 @@ function renderKpi(
   trend: StatsSeriesPoint[],
   key: SeriesKey,
   tone: string,
+  delta = "",
 ): string {
   return `
     <article class="kpi-card tone-${tone}">
-      <div><span>${escapeHtml(label)}</span><strong>${typeof value === "number" ? integerFormatter.format(value) : escapeHtml(value)}</strong></div>
+      <div><span>${escapeHtml(label)}</span><strong>${typeof value === "number" ? integerFormatter.format(value) : escapeHtml(value)}${delta}</strong></div>
       <div class="kpi-spark">${renderSparkline(trend.map((point) => point[key]))}</div>
       <small>${escapeHtml(detail)}</small>
     </article>
@@ -601,8 +748,9 @@ function renderTimeChart(
   `;
 }
 
-function renderFunnel(snapshot: StatsSnapshot): string {
+function renderFunnel(snapshot: StatsSnapshot, peopleSince: number | null): string {
   const steps = snapshot.funnel;
+  const since = peopleSince === null ? "" : ` since ${escapeHtml(formatDay(peopleSince))}`;
   const colors = ["#9ab7e8", "#8eafff", "#819de5", "#f4bd78", "#8eafff", "#75dac2", "#d7a6ff"];
   const maximum = Math.max(1, ...steps.map((step) => step.count));
   return `
@@ -610,23 +758,45 @@ function renderFunnel(snapshot: StatsSnapshot): string {
       ${steps.map((step, index) => {
         const width = step.count === 0 ? 1.5 : Math.max(4, step.count / maximum * 100);
         const basis = step.basis === null ? null : steps.find((candidate) => candidate.key === step.basis) ?? null;
+        const basisCount = step.basisCount ?? basis?.count ?? 0;
+        const basisLabel = step.basisLabel ?? basis?.label.toLowerCase() ?? "";
         const share = basis === null
           ? (index === 0 ? "the whole path starts here" : "its own population")
-          : basis.count === 0
-            ? `no ${basis.label.toLowerCase()} to compare with`
-            : `${formatPercent(ratio(step.count, basis.count))} of ${basis.label.toLowerCase()}`;
+          : basisCount === 0
+            ? `no ${basisLabel} to compare with`
+            : `${formatPercent(ratio(step.count, basisCount))} of ${basisLabel}`;
+        const excluded = step.excluded.length === 0
+          ? ""
+          : `<em class="funnel-excluded">+ ${step.excluded.map((entry) => `${integerFormatter.format(entry.count)} ${escapeHtml(entry.label)}`).join(" · ")}</em>`;
         return `
           <div class="funnel-step">
             <span>${escapeHtml(step.label)}</span>
-            <b>${integerFormatter.format(step.count)}${step.unique === null ? "" : `<small>${integerFormatter.format(step.unique)} ${step.unique === 1 ? "person" : "people"}</small>`}</b>
+            <b>${integerFormatter.format(step.count)}${step.unique === null ? "" : `<small>${integerFormatter.format(step.unique)} ${step.unique === 1 ? "person" : "people"}${since}</small>`}</b>
             <div><i style="width:${width}%;--funnel:${colors[index % colors.length]}"></i></div>
             <em>${escapeHtml(share)}</em>
+            ${excluded}
             <small>${escapeHtml(step.note)}</small>
           </div>
         `;
       }).join("")}
     </div>
   `;
+}
+
+/**
+ * The one line that crosses from the installer to the CLI: of the machines
+ * that installed long enough ago to tell, how many started a session within
+ * the window. Fresh installs are named separately rather than counted as
+ * misses.
+ */
+function renderInstallConversion(snapshot: StatsSnapshot): string {
+  const conversion = snapshot.installConversion;
+  if (conversion === null || conversion.installers === 0) return "";
+  const fresh = conversion.installers - conversion.matured;
+  const verdict = conversion.matured === 0
+    ? `${integerFormatter.format(conversion.installers)} machine${conversion.installers === 1 ? "" : "s"} installed in this range, all within the last ${INSTALL_CONVERSION_DAYS} days, too recently to tell whether a session followed.`
+    : `Of the ${integerFormatter.format(conversion.matured)} machine${conversion.matured === 1 ? "" : "s"} that installed at least ${INSTALL_CONVERSION_DAYS} days ago, ${integerFormatter.format(conversion.started)} (${formatPercent(ratio(conversion.started, conversion.matured))}) started a session within ${INSTALL_CONVERSION_DAYS} days.${fresh > 0 ? ` ${integerFormatter.format(fresh)} more installed too recently to tell.` : ""}`;
+  return `<p class="cohort-empty">${escapeHtml(verdict)} Machines are followed by address from the binary download to the first session.</p>`;
 }
 
 function renderUniquesStrip(snapshot: StatsSnapshot): string {
@@ -721,6 +891,7 @@ function renderAccounts(snapshot: StatsSnapshot): string {
         </div>
         <div class="kpi-spark">${renderSparkline(accounts.newByDay.map((point) => point.count))}</div>
         <p class="cohort-empty">New accounts per day. Active means the account used the app in the range.</p>
+        ${renderAccountEvents(accounts.events)}
       </article>
       ${renderCohorts(
         "Accounts that came back",
@@ -734,8 +905,15 @@ function renderAccounts(snapshot: StatsSnapshot): string {
   `;
 }
 
+/** A dashboard day is a UTC day, so it is named in UTC wherever the reader is. */
+function formatDay(at: number, month: "short" | "long" = "short"): string {
+  return new Date(at).toLocaleDateString([], month === "long"
+    ? { month, day: "numeric", year: "numeric", timeZone: "UTC" }
+    : { month, day: "numeric", timeZone: "UTC" });
+}
+
 function formatWeek(weekStart: number): string {
-  return new Date(weekStart).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "UTC" });
+  return formatDay(weekStart);
 }
 
 function renderDonut(items: StatsBreakdownItem[]): string {
@@ -763,11 +941,65 @@ function renderDonut(items: StatsBreakdownItem[]): string {
   `;
 }
 
+/**
+ * What accounts did, in the order the product hopes for: link a machine,
+ * register a session, send it a command. Counts of things done, not of
+ * accounts, since the app sends no identifiers with them.
+ */
+function renderAccountEvents(events: Record<string, number>): string {
+  const order = ["machine_linked", "session_registered", "command_sent", "vault_created", "invite_created", "invite_accepted", "feedback_sent"];
+  const items = order.filter((key) => (events[key] ?? 0) > 0).map((key) => ({ label: key, value: events[key] }));
+  if (items.length === 0) {
+    return '<p class="cohort-empty">Nothing done in the app in this range yet: no machine linked, session registered, command sent, vault created, invite, or feedback.</p>';
+  }
+  const maximum = Math.max(1, ...items.map((item) => item.value));
+  return `
+    <div class="breakdown-list accounts-events">
+      ${items.map((item) => `
+        <div>
+          <span>${escapeHtml(humanize(item.label))}</span>
+          <i><b style="width:${Math.max(2, item.value / maximum * 100)}%"></b></i>
+          <strong>${integerFormatter.format(item.value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+    <p class="cohort-empty">Things done, not distinct accounts: one account linking three machines counts three times.</p>
+  `;
+}
+
+/** A panel of rates: each row a share of its own denominator, not of a total. */
+function renderRates(
+  title: string,
+  description: string,
+  rows: { label: string; numerator: number; denominator: number }[],
+  footnote = "",
+): string {
+  const shown = rows.filter((row) => row.denominator > 0).sort((left, right) => right.denominator - left.denominator);
+  return `
+    <article class="stats-panel breakdown-panel kind-rate">
+      <header class="panel-heading">
+        <div><span class="panel-kicker">${escapeHtml(description)}</span><h2>${escapeHtml(title)}</h2></div>
+      </header>
+      <div class="breakdown-list">
+        ${shown.slice(0, 7).map((row) => `
+          <div>
+            <span>${escapeHtml(humanize(row.label))}</span>
+            <i><b style="width:${Math.max(2, ratio(row.numerator, row.denominator) * 100)}%"></b></i>
+            <strong>${formatPercent(ratio(row.numerator, row.denominator))} <small>${integerFormatter.format(row.numerator)} of ${integerFormatter.format(row.denominator)}</small></strong>
+          </div>
+        `).join("") || "<em>No opened sessions in this range yet.</em>"}
+      </div>
+      ${footnote ? `<p class="cohort-empty">${escapeHtml(footnote)}</p>` : ""}
+    </article>
+  `;
+}
+
 function renderBreakdown(
   title: string,
   description: string,
   items: StatsBreakdownItem[],
   kind: string,
+  footnote = "",
 ): string {
   const maximum = Math.max(1, ...items.map((item) => item.value));
   return `
@@ -785,6 +1017,7 @@ function renderBreakdown(
           </div>
         `).join("") || "<em>No events in this range yet.</em>"}
       </div>
+      ${footnote ? `<p class="cohort-empty">${escapeHtml(footnote)}</p>` : ""}
     </article>
   `;
 }
@@ -856,18 +1089,6 @@ function renderSkeleton(): string {
   `;
 }
 
-function formatDuration(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3_600) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 86_400) return `${numberFormatter.format(seconds / 3_600)}h`;
-  return `${numberFormatter.format(seconds / 86_400)}d`;
-}
-
-function formatPercent(value: number): string {
-  return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
-}
-
 function formatChartTime(at: number, range: StatsRange): string {
   const date = new Date(at);
   if (range === "24h") return date.toLocaleTimeString([], { hour: "numeric" });
@@ -892,65 +1113,6 @@ function formatRelativeTime(at: number): string {
 
 function formatDate(at: number): string {
   return new Date(at).toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" });
-}
-
-function humanize(value: string): string {
-  const aliases: Record<string, string> = {
-    cli: "CLI",
-    web: "Web",
-    direct: "Direct",
-    internal: "Internal",
-    hacker_news: "Hacker News",
-    task_exit: "Task exited",
-    disconnected_timeout: "Disconnected timeout",
-    never_started: "Never started",
-    remote_input: "Remote input",
-    cta_click: "Sign-up click",
-    signup_nav: "Sign up free (nav)",
-    signup_hero: "Sign up free (hero)",
-    signup_team: "Manage a team",
-    signup_footer: "Web app (footer)",
-    not_found: "Not found (404)",
-    unknown_path: "Unknown path (served the landing page)",
-    landing: "Landing",
-    docs: "Docs",
-    docs_app: "Docs · Web app",
-    docs_cli: "Docs · CLI",
-    docs_platforms: "Docs · Platforms",
-    docs_mobile: "Docs · Mobile",
-    docs_refstream: "Docs · Refstream",
-    docs_reliability: "Docs · Reliability",
-    docs_security: "Docs · Security",
-    docs_e2ee: "Docs · E2EE",
-    docs_docker: "Docs · Docker",
-    docs_self_hosting: "Docs · Self-hosting",
-    session: "Shared terminal",
-    installer_download: "Installer fetched",
-    binary_download: "Install completed",
-    share_opened: "Opened in a browser",
-    viewer_connected: "Viewer connected",
-    viewer_disconnected: "Viewer disconnected",
-    collaboration_started: "Typed from a browser",
-    session_created: "Session created",
-    session_started: "Session started",
-    session_ended: "Session ended",
-    page_view: "Page view",
-    skill_download: "Skill fetched",
-    stats_view: "Dashboard view",
-    posix: "Install script (POSIX)",
-    powershell: "Install script (PowerShell)",
-    darwin_arm64: "macOS arm64",
-    darwin_amd64: "macOS amd64",
-    linux_arm64: "Linux arm64",
-    linux_amd64: "Linux amd64",
-  };
-  const normalized = value.replace(/-/g, "_");
-  if (aliases[normalized]) return aliases[normalized];
-  return value.replace(/[_-]+/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function ratio(numerator: number, denominator: number): number {
-  return denominator === 0 ? 0 : Math.min(1, numerator / denominator);
 }
 
 function isClientStatsRange(value: string | undefined): value is StatsRange {
