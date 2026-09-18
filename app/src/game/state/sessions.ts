@@ -1,5 +1,6 @@
 import { kindForCommand } from "../../lib/session-kinds";
 import type { Member, SessionRecord } from "../../lib/api";
+import { sessionEnded } from "../../lib/session-liveness";
 import { workFor, type Work } from "../world/work";
 import type { HeroInput, SoldierInput } from "../world/sim";
 
@@ -57,13 +58,36 @@ const MAX_SOLDIERS = 240;
 const MAX_PER_HERO = 14;
 
 /**
- * Whether a session is still running, and so still has a soldier.
+ * Whether a session is still running and still being worked in, and so still
+ * has a soldier.
  *
- * A closed session is work that is finished. It counts towards experience,
- * which the service works out separately; it does not stand on the field.
+ * Two conditions, and both of them were wrong before.
+ *
+ * **It has not finished.** This used to ask only whether the row carried a
+ * `closedAt`, which is the one way a session ends that the service records
+ * promptly. The commoner ending is the process exiting or the relay losing the
+ * machine, and the console has always known that: `sessionEnded` is the same
+ * test the session list uses to grey a row out and to offer to tidy it away.
+ * The game asking a weaker question meant finished sessions stood on the field
+ * as live soldiers -- a garrison that only ever grew, and a read-out that said
+ * a quiet afternoon was the busiest day of the week.
+ *
+ * **It can be written to.** `readOnly` is set when the session is started and
+ * means nobody can type into it: it is a broadcast of a terminal rather than
+ * work being done in one. A soldier stands for work in progress, so a session
+ * nobody can act in does not have one.
+ *
+ * That is a deliberate narrowing and it has a cost worth knowing about: a live
+ * read-only session is not counted towards the garrison either, so somebody
+ * who shares a terminal read-only is, by this reckoning, one session short.
+ *
+ * Neither kind is thrown away: a finished session is what experience is made
+ * of, which the service counts separately, and a read-only one is still in the
+ * session list where it belongs.
  */
 export function isOnTheField(session: SessionRecord): boolean {
-  return session.closedAt === undefined;
+  if (sessionEnded(session)) return false;
+  return !session.readOnly;
 }
 
 /**
