@@ -4,6 +4,63 @@ All notable user-visible changes are recorded here. Versions follow [Semantic Ve
 
 ## Unreleased
 
+## [0.17.0] — 2026-09-18
+
+### Changed
+
+- `shell login` asks whether your browser may start sessions on this machine
+  once, on the first login for that account, instead of at every sign-in. The
+  question was re-put every time so that somebody who missed it had a way back
+  to it; the way back is the line printed after every login, which now names
+  the command that reverses whichever way it stands, on all three branches.
+  Signing in again is not a consent decision. A different account signing in is,
+  so it is asked again. `--allow-remote-start` and `--no-remote-start` still
+  answer it outright, and still reverse a settled answer without a prompt.
+- Agreeing for the first time also installs the daemon as a user service -- a
+  LaunchAgent on macOS, a systemd user unit on Linux -- so the machine is
+  reachable after a restart without anybody logging in and running something.
+  That is the case the service exists for: a machine you want to reach from a
+  browser is a machine nobody is sitting at. Only on the first agreement, so
+  `shell service uninstall` is not quietly undone by the next login; a machine
+  that cannot install one still signs in and says what it could not do.
+- A login on a machine that has a service installed now restarts the daemon
+  through that service rather than spawning a detached one beside it.
+
+### Fixed
+
+- A session whose machine is rebooted or loses power now reaches Finished
+  instead of sitting in Write for the relay's twelve-hour retention. Nothing
+  used to close those sessions: the CLI reports an exit as its process ends,
+  and a machine that dies never gets to. Three things now do. The machine
+  closes them itself when it comes back up, having kept a note of what it left
+  running. The relay says when it last held a host socket, so a machine that
+  has been silent longer than any reconnect could take reads as "Machine gone"
+  rather than merely offline -- and reads as live again by itself if it comes
+  back. And a session the relay no longer has at all is written down as closed.
+- A signed-in machine no longer drops to "offline" while nothing is wrong with
+  it. What keeps a machine online is one thing -- the agent's poll, which the
+  service dates -- and two situations stopped that poll. A renewal that failed
+  stood the poll down for as long as the retry backoff, up to a minute, even
+  though renewal begins a minute *before* the token expires and the token in
+  hand was still good; the poll now continues while renewal retries on its own
+  schedule, and a poll that succeeds clears the backoff rather than leaving the
+  machine renewing on a minute's delay for the rest of its life. And a token
+  the service refused was never renewed at all if the machine's own clock said
+  it was still valid, so a skewed clock or a sign-in retired elsewhere left it
+  presenting the same dead token every two seconds until somebody ran
+  `shell login`. A refusal now renews whatever the clock says, and credentials
+  that are genuinely finished say so and ask for `shell login` instead of going
+  quiet.
+- Session state stopped flickering. A card could alternate between "Offline"
+  and "Status unavailable" every few seconds, and so between the Write and
+  Finished columns, while nothing about the session changed: a relay check
+  that was rate-limited, timed out, or landed on a worker with a cold cache
+  overwrote a state the service already had with "unknown". A failed check is
+  now a gap in knowledge rather than news, and no longer replaces what was
+  last seen. Machines that are away are also no longer re-confirmed every five
+  seconds, which used to spend the whole check budget and leave sessions nobody
+  had looked at yet reading "Status unavailable" indefinitely.
+
 ## [0.16.2] — 2026-09-17
 
 ### Fixed
