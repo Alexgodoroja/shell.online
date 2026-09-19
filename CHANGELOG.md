@@ -4,8 +4,23 @@ All notable user-visible changes are recorded here. Versions follow [Semantic Ve
 
 ## Unreleased
 
+### Added
+
+- The statistics dashboard now includes account growth and activity: total
+  accounts, sign-ups, app opens, returning accounts, daily trends, feature
+  usage, active days, and retention cohorts.
+- `STATS_EXCLUDE` lets operators omit internal addresses or domains from
+  customer statistics. The dashboard reports the excluded count without
+  exposing identifiers.
+
 ### Fixed
 
+- Scheduled download checks no longer inflate installs, installer outcomes,
+  or machine counts. Install checks identify themselves and do not report
+  telemetry; monitors, HTTP libraries, and PowerShell web requests are no
+  longer classified as people.
+- Install and session tiles use their own trend series, prefetched pages are
+  ignored, and new-versus-returning labels wait until enough history exists.
 - `shell login` no longer sits there for eleven seconds after it has already
   succeeded. On a machine with the background service installed it asked the
   supervisor to replace the daemon and then waited for that to finish, and
