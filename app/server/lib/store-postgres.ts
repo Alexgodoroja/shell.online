@@ -13,7 +13,23 @@ import {
   type McpFlow,
   type McpFlowEvent,
 } from "./mcp-flows";
-import type { Invite, Membership, Organization, Role } from "./orgs";
+import { JEV_BUDGET, JEV_MAX_SNAPSHOTS } from "./jev/limits";
+import type { AssessmentSnapshot, JevConsent } from "./jev/integration";
+import {
+  MCP_TEAM_GLOBAL_LIMIT,
+  MCP_TEAM_ISSUED_LIMIT,
+  MCP_TEAM_PENDING_LIMIT,
+  MCP_TEAM_REQUEST_TTL,
+  MCP_TEAM_REVOKED_LIMIT,
+  sealTeamBearer,
+  teamPublisher,
+  type McpTeamGrantReport,
+  type McpTeamHostRequest,
+  type McpTeamRequest,
+  type McpTeamReportResult,
+  type McpTeamRequestResult,
+} from "./mcp-team";
+import { newId, type Invite, type Membership, type Organization, type Role } from "./orgs";
 import {
   ACCOUNT_ACTIVITY_MEMORY_MS,
   DAY_MS,
@@ -78,6 +94,7 @@ const MIGRATION_LOCK = 731_099_431;
  * and the trim it triggers see the table as one writer would leave it.
  */
 const MCP_FLOWS_GLOBAL_LOCK = 731_099_432;
+const MCP_TEAM_GLOBAL_LOCK = 731_099_433;
 
 /** Drops keys whose value is null, so an absent column reads as `undefined`. */
 function defined<T extends object>(record: T): T {
@@ -235,6 +252,46 @@ function toMcpFlow(row: Row): McpFlow {
     at: row.at as number,
     ...(row.outcome ? { outcome: row.outcome as McpFlow["outcome"] } : {}),
     targetSessionId: row.target_session_id as string,
+  };
+}
+
+function toJevConsent(row: Row): JevConsent {
+  return {
+    externalAnalysis: row.enabled as boolean,
+    updatedAt: Number(row.updated_at),
+    updatedBy: row.updated_by as string,
+  };
+}
+
+function toJevAssessment(row: Row): AssessmentSnapshot {
+  return {
+    sessionId: row.session_id as string,
+    generation: Number(row.generation ?? 0),
+    observedAt: Number(row.observed_at),
+    expiresAt: Number(row.expires_at),
+    model: row.model as AssessmentSnapshot["model"],
+    observed: (row.observed ?? {}) as Record<string, unknown>,
+    disclaimer: row.disclaimer as string,
+  };
+}
+
+function toMcpTeamRequest(row: Row): McpTeamRequest {
+  return {
+    requestId: row.request_id as string,
+    orgId: row.org_id as string,
+    sessionId: row.session_id as string,
+    requesterUid: row.requester_uid as string,
+    status: row.status as McpTeamRequest["status"],
+    createdAt: Number(row.created_at),
+    expiresAt: Number(row.expires_at),
+    recipientPublicKey: row.recipient_public_key as string,
+    sealedToRecipient: row.sealed_to_recipient === true,
+    ...(row.grant_id ? { grantId: row.grant_id as string } : {}),
+    ...(row.grant_expires_at !== null ? { grantExpiresAt: Number(row.grant_expires_at) } : {}),
+    ...(row.bearer ? { bearer: row.bearer as string } : {}),
+    ...(row.delivered_at !== null ? { deliveredAt: Number(row.delivered_at) } : {}),
+    ...(row.issued_at !== null ? { issuedAt: Number(row.issued_at) } : {}),
+    ...(row.revoked_at !== null ? { revokedAt: Number(row.revoked_at) } : {}),
   };
 }
 
@@ -1006,6 +1063,723 @@ export class PostgresStore implements Store {
     }
   }
 
+  /* ---- External analysis (Jev) ---- */
+
+  async jevConsent(orgId: string, ownerUid: string): Promise<JevConsent | null> {
+    const result = await this.pool.query<Row>(
+      `SELECT * FROM external_analysis_consents WHERE org_id = $1 AND owner_uid = $2`,
+      [orgId, ownerUid],
+    );
+    return result.rows[0] ? toJevConsent(result.rows[0]) : null;
+  }
+
+  async putJevConsent(
+    orgId: string,
+    ownerUid: string,
+    enabled: boolean,
+    updatedBy: string,
+    expectedUpdatedAt: number | null,
+    now = Date.now(),
+  ): Promise<JevConsent | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      /*
+       * One per-owner advisory lock, shared with the assessment write and the
+       * revocation purge. The row lock below cannot serialize two *initial*
+       * writers, because absence has no row to lock: without this, both would
+       * read absence and one would raise a uniqueness error instead of the
+       * documented null conflict.
+       */
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`jev_consent:${orgId}:${ownerUid}`]);
+      /* The row lock makes the compare-and-swap exact: two writers serialize
+         here, and only the one holding the stored version can move it. */
+      const found = await client.query<Row>(
+        `SELECT * FROM external_analysis_consents WHERE org_id = $1 AND owner_uid = $2 FOR UPDATE`,
+        [orgId, ownerUid],
+      );
+      const existing = found.rows[0];
+      if ((existing ? Number(existing.updated_at) : null) !== expectedUpdatedAt) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      /* Strictly newer than whatever was stored, even within a millisecond. */
+      const updatedAt = Math.max(now, (existing ? Number(existing.updated_at) : 0) + 1);
+      const saved = existing
+        ? await client.query<Row>(
+            `UPDATE external_analysis_consents SET enabled = $3, updated_at = $4, updated_by = $5
+             WHERE org_id = $1 AND owner_uid = $2 RETURNING *`,
+            [orgId, ownerUid, enabled, updatedAt, updatedBy],
+          )
+        : await client.query<Row>(
+            `INSERT INTO external_analysis_consents (org_id, owner_uid, enabled, updated_at, updated_by)
+             VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+            [orgId, ownerUid, enabled, updatedAt, updatedBy],
+          );
+      /* Revocation deletes every cached result in the same transaction, so
+         no reader depends on remembering to purge afterwards. */
+      if (!enabled) {
+        await client.query(`DELETE FROM jev_assessments WHERE org_id = $1 AND owner_uid = $2`, [
+          orgId,
+          ownerUid,
+        ]);
+      }
+      await client.query("COMMIT");
+      return toJevConsent(saved.rows[0]);
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async consumeJevBudget(orgId: string, ownerUid: string, chars: number, now = Date.now()): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      /*
+       * One advisory lock per owner serializes every worker's spend, so the
+       * window is enforced across service instances and not per process.
+       */
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`jev_budget:${orgId}:${ownerUid}`]);
+      await client.query(`DELETE FROM jev_budget WHERE org_id = $1 AND owner_uid = $2 AND at <= $3`, [
+        orgId,
+        ownerUid,
+        now - JEV_BUDGET.windowMs,
+      ]);
+      const spent = await client.query<Row>(
+        `SELECT COUNT(*) AS hits, COALESCE(SUM(chars), 0) AS chars FROM jev_budget WHERE org_id = $1 AND owner_uid = $2`,
+        [orgId, ownerUid],
+      );
+      const hits = Number(spent.rows[0]?.hits ?? 0);
+      const charsSpent = Number(spent.rows[0]?.chars ?? 0);
+      const cost = Math.max(0, Math.floor(chars));
+      if (hits >= JEV_BUDGET.maxRequests || charsSpent + cost > JEV_BUDGET.maxInputChars) {
+        await client.query("COMMIT");
+        return false;
+      }
+      await client.query(`INSERT INTO jev_budget (org_id, owner_uid, at, chars) VALUES ($1, $2, $3, $4)`, [
+        orgId,
+        ownerUid,
+        now,
+        cost,
+      ]);
+      await client.query("COMMIT");
+      return true;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async putJevAssessment(
+    orgId: string,
+    ownerUid: string,
+    snapshot: AssessmentSnapshot,
+    expectedUpdatedAt: number,
+  ): Promise<boolean> {
+    /*
+     * One predicate, one statement: the SELECT yields a row only while the
+     * consent is enabled at exactly the version the model call started under
+     * and the session is still open and owned. The conflict path replaces the
+     * previous snapshot for the same session, so the table stays one row per
+     * owner and session, and a revoke that lands mid-call leaves nothing.
+     */
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      /*
+       * The same per-owner lock the consent CAS and the revocation purge take.
+       * Under READ COMMITTED a bare INSERT..SELECT could retain a predicate
+       * snapshot taken before a revoke, then commit after the purge and leave
+       * a row behind. Serialized, the two orders are the only ones: either the
+       * write lands first and the revoke purges it in the same step, or the
+       * revoke lands first and the locked predicate below sees it and refuses.
+       */
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`jev_consent:${orgId}:${ownerUid}`]);
+      const consent = await client.query<Row>(
+        `SELECT * FROM external_analysis_consents WHERE org_id = $1 AND owner_uid = $2 FOR UPDATE`,
+        [orgId, ownerUid],
+      );
+      const consentRow = consent.rows[0];
+      if (!consentRow || !consentRow.enabled || Number(consentRow.updated_at) !== expectedUpdatedAt) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      /*
+       * The session row is locked too: a close or ownership change that lands
+       * first makes the predicate false, and one that lands second waits and
+       * then leaves the row unservable (the list rechecks this same binding).
+       */
+      const session = await client.query<Row>(
+        `SELECT * FROM sessions
+         WHERE org_id = $1 AND id = $2 AND COALESCE(owner_uid, uid) = $3 AND closed_at IS NULL
+         FOR UPDATE`,
+        [orgId, snapshot.sessionId, ownerUid],
+      );
+      const sessionRow = session.rows[0];
+      if (!sessionRow) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      const inserted = await client.query<Row>(
+        `INSERT INTO jev_assessments
+           (org_id, owner_uid, session_id, started_at, generation, observed_at, expires_at, model, observed, disclaimer)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)
+         ON CONFLICT (org_id, owner_uid, session_id) DO UPDATE
+           SET started_at = EXCLUDED.started_at,
+               generation = EXCLUDED.generation,
+               observed_at = EXCLUDED.observed_at,
+               expires_at = EXCLUDED.expires_at,
+               model = EXCLUDED.model,
+               observed = EXCLUDED.observed,
+               disclaimer = EXCLUDED.disclaimer
+         RETURNING session_id`,
+        [
+          orgId,
+          ownerUid,
+          snapshot.sessionId,
+          Number(sessionRow.started_at),
+          snapshot.generation,
+          snapshot.observedAt,
+          snapshot.expiresAt,
+          JSON.stringify(snapshot.model),
+          JSON.stringify(snapshot.observed),
+          snapshot.disclaimer,
+        ],
+      );
+      await client.query("COMMIT");
+      return inserted.rows.length > 0;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listJevAssessments(orgId: string, ownerUid: string, now = Date.now()): Promise<AssessmentSnapshot[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      /* Purge what lost its session or its life, so a reactivated session id
+         cannot resurrect an old snapshot. */
+      await client.query(
+        `DELETE FROM jev_assessments
+         WHERE org_id = $1 AND owner_uid = $2
+           AND (expires_at <= $3
+             OR NOT EXISTS (
+               SELECT 1 FROM sessions s
+               WHERE s.org_id = $1 AND s.id = jev_assessments.session_id
+                 AND COALESCE(s.owner_uid, s.uid) = $2
+                 AND s.started_at = jev_assessments.started_at
+                 AND s.closed_at IS NULL
+             ))`,
+        [orgId, ownerUid, now],
+      );
+      const rows = await client.query<Row>(
+        `SELECT * FROM jev_assessments
+         WHERE org_id = $1 AND owner_uid = $2 AND expires_at > $3
+         ORDER BY observed_at DESC, session_id COLLATE "C" DESC
+         LIMIT $4`,
+        [orgId, ownerUid, now, JEV_MAX_SNAPSHOTS],
+      );
+      await client.query("COMMIT");
+      return rows.rows.map(toJevAssessment);
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async dropJevAssessments(orgId: string, ownerUid: string, sessionIds: string[]): Promise<number> {
+    if (sessionIds.length === 0) return 0;
+    const result = await this.pool.query(
+      `DELETE FROM jev_assessments WHERE org_id = $1 AND owner_uid = $2 AND session_id = ANY($3)`,
+      [orgId, ownerUid, sessionIds],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async clearJevAssessments(orgId: string, ownerUid: string): Promise<number> {
+    const result = await this.pool.query(
+      `DELETE FROM jev_assessments WHERE org_id = $1 AND owner_uid = $2`,
+      [orgId, ownerUid],
+    );
+    return result.rowCount ?? 0;
+  }
+
+  /* ---- Team MCP grants ---- */
+
+  /**
+   * The team table's locks, in the one order every team transaction uses:
+   * global, then session. The global lock makes the global cap honest; the
+   * session lock keeps the per-session caps honest. Same deadlock argument
+   * as the flow table: a team transaction waits on a session row only while
+   * holding locks no other transaction asks for.
+   */
+  private async lockTeamSession(client: pg.PoolClient, orgId: string, sessionId: string): Promise<void> {
+    await client.query("SELECT pg_advisory_xact_lock($1)", [MCP_TEAM_GLOBAL_LOCK]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`mcp_team:${orgId}:${sessionId}`]);
+  }
+
+  /**
+   * Keeps the table at its bounds, in the caller's transaction, which must
+   * already hold the team table locks. A row is swept once it has done
+   * everything it can (pending past its deadline, revoked past the grace,
+   * issued past its grant's expiry); over-cap rows are revoked, not deleted.
+   */
+  private async trimMcpTeamRows(client: pg.PoolClient, now: number): Promise<void> {
+    await client.query(
+      `DELETE FROM mcp_team_grants
+       WHERE (status = 'pending' AND expires_at <= $1::bigint - 3600000)
+          OR (status = 'revoked' AND COALESCE(revoked_at, created_at) <= $1::bigint - 3600000)
+          OR (status = 'issued' AND COALESCE(grant_expires_at, created_at) <= $1::bigint - 3600000)`,
+      [now],
+    );
+    await client.query(
+      `WITH ranked AS (
+         SELECT ctid, org_id, session_id, status,
+                row_number() OVER (
+                  PARTITION BY org_id, session_id, status
+                  ORDER BY created_at DESC, request_id COLLATE "C" DESC
+                ) AS rank
+         FROM mcp_team_grants
+       )
+       UPDATE mcp_team_grants r
+       SET status = 'revoked', revoked_at = $1
+       FROM ranked
+       WHERE r.ctid = ranked.ctid AND r.status <> 'revoked'
+         AND (
+           (ranked.status = 'pending' AND ranked.rank > $2)
+           OR (ranked.status = 'issued' AND ranked.rank > $3)
+           OR (ranked.status = 'revoked' AND ranked.rank > $4)
+         )`,
+      [now, MCP_TEAM_PENDING_LIMIT, MCP_TEAM_ISSUED_LIMIT, MCP_TEAM_REVOKED_LIMIT],
+    );
+    const total = await client.query<{ total: number }>("SELECT count(*)::int AS total FROM mcp_team_grants");
+    if ((total.rows[0]?.total ?? 0) > MCP_TEAM_GLOBAL_LIMIT) {
+      await client.query(
+        `WITH ranked AS (
+           SELECT ctid, row_number() OVER (ORDER BY created_at DESC, request_id COLLATE "C" DESC) AS rank
+           FROM mcp_team_grants
+         )
+         UPDATE mcp_team_grants r
+         SET status = 'revoked', revoked_at = $1
+         FROM ranked
+         WHERE r.ctid = ranked.ctid AND r.status <> 'revoked' AND ranked.rank > $2`,
+        [now, MCP_TEAM_GLOBAL_LIMIT],
+      );
+    }
+  }
+
+  async requestMcpTeamGrant(
+    orgId: string,
+    sessionId: string,
+    requesterUid: string,
+    recipientPublicKey: string,
+    now = Date.now(),
+  ): Promise<{ result: McpTeamRequestResult; requestId?: string; expiresAt?: number }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.lockTeamSession(client, orgId, sessionId);
+      await this.trimMcpTeamRows(client, now);
+      const total = await client.query<{ count: number }>("SELECT count(*)::int AS count FROM mcp_team_grants");
+      if ((total.rows[0]?.count ?? 0) >= MCP_TEAM_GLOBAL_LIMIT) {
+        await client.query("COMMIT");
+        return { result: "limited" };
+      }
+      const found = await client.query<Row>(
+        `SELECT * FROM sessions WHERE org_id = $1 AND id = $2 FOR UPDATE`,
+        [orgId, sessionId],
+      );
+      const row = found.rows[0];
+      if (!row) {
+        await client.query("ROLLBACK");
+        return { result: "missing" };
+      }
+      if (row.closed_at !== null) {
+        await client.query("ROLLBACK");
+        return { result: "closed" };
+      }
+      if (row.mcp_team_access !== true) {
+        await client.query("ROLLBACK");
+        return { result: "disabled" };
+      }
+      const pending = await client.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM mcp_team_grants
+         WHERE org_id = $1 AND session_id = $2 AND status = 'pending' AND expires_at > $3`,
+        [orgId, sessionId, now],
+      );
+      if ((pending.rows[0]?.count ?? 0) >= MCP_TEAM_PENDING_LIMIT) {
+        await client.query("ROLLBACK");
+        return { result: "limited" };
+      }
+      const requestId = newId("mcp");
+      const expiresAt = now + MCP_TEAM_REQUEST_TTL;
+      await client.query(
+        `INSERT INTO mcp_team_grants (org_id, session_id, request_id, requester_uid, recipient_public_key, status, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)`,
+        [orgId, sessionId, requestId, requesterUid, recipientPublicKey, now, expiresAt],
+      );
+      await this.trimMcpTeamRows(client, now);
+      await client.query("COMMIT");
+      return { result: "stored", requestId, expiresAt };
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async mcpTeamRequest(
+    orgId: string,
+    sessionId: string,
+    requesterUid: string,
+    requestId: string,
+    now = Date.now(),
+  ): Promise<McpTeamRequest | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.lockTeamSession(client, orgId, sessionId);
+      await this.trimMcpTeamRows(client, now);
+      await client.query(
+        `UPDATE mcp_team_grants r SET status = 'revoked', revoked_at = $5, bearer = NULL
+         WHERE r.org_id = $1 AND r.session_id = $2 AND r.requester_uid = $3 AND r.request_id = $4
+           AND r.status <> 'revoked' AND (
+             (r.status = 'issued' AND COALESCE(r.grant_expires_at, 0) <= $5)
+             OR NOT EXISTS (SELECT 1 FROM sessions s WHERE s.org_id = $1 AND s.id = $2
+                            AND s.closed_at IS NULL AND s.mcp_team_access = TRUE)
+             OR NOT EXISTS (SELECT 1 FROM memberships m WHERE m.org_id = $1 AND m.uid = $3))`,
+        [orgId, sessionId, requesterUid, requestId, now],
+      );
+      /*
+       * The credential is delivered exactly once, and it is out of the table
+       * the moment it is delivered: the row lock makes two racing fetches
+       * serialize, and only the first of them finds it still there.
+       */
+      const claim = await client.query<Row>(
+        `SELECT * FROM mcp_team_grants
+         WHERE org_id = $1 AND session_id = $2 AND requester_uid = $3 AND request_id = $4
+           AND status = 'issued' AND bearer IS NOT NULL AND delivered_at IS NULL
+         FOR UPDATE`,
+        [orgId, sessionId, requesterUid, requestId],
+      );
+      if (claim.rows[0]) {
+        await client.query(
+          `UPDATE mcp_team_grants
+           SET delivered_at = $5, bearer = NULL
+           WHERE org_id = $1 AND session_id = $2 AND requester_uid = $3 AND request_id = $4`,
+          [orgId, sessionId, requesterUid, requestId, now],
+        );
+        await client.query("COMMIT");
+        return toMcpTeamRequest(claim.rows[0]);
+      }
+      const result = await client.query<Row>(
+        `SELECT * FROM mcp_team_grants
+         WHERE org_id = $1 AND session_id = $2 AND requester_uid = $3 AND request_id = $4`,
+        [orgId, sessionId, requesterUid, requestId],
+      );
+      await client.query("COMMIT");
+      return result.rows[0] ? toMcpTeamRequest(result.rows[0]) : null;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listMcpTeamRequests(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    now = Date.now(),
+  ): Promise<{ issues: McpTeamHostRequest[]; revocations: McpTeamHostRequest[] } | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.lockTeamSession(client, orgId, sessionId);
+      const found = await client.query<Row>(
+        `SELECT * FROM sessions WHERE org_id = $1 AND id = $2 FOR UPDATE`,
+        [orgId, sessionId],
+      );
+      const row = found.rows[0];
+      if (!row || row.closed_at !== null || !teamPublisher(toSession(row, []), orgId, ownerUid, deviceId)) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      /*
+       * Recheck every live row against the world as it is now: a requester
+       * who left the organization, or a consent that just turned off,
+       * revokes on the way so this poll carries the revocation.
+       */
+      await client.query(
+        `UPDATE mcp_team_grants r
+         SET status = 'revoked', revoked_at = $3
+         WHERE r.org_id = $1 AND r.session_id = $2 AND r.status <> 'revoked'
+           AND ($4::boolean = false
+                OR NOT EXISTS (SELECT 1 FROM memberships m WHERE m.org_id = $1 AND m.uid = r.requester_uid))`,
+        [orgId, sessionId, now, row.mcp_team_access === true],
+      );
+      await this.trimMcpTeamRows(client, now);
+      const result = await client.query<Row>(
+        `SELECT * FROM mcp_team_grants
+         WHERE org_id = $1 AND session_id = $2
+           AND ((status = 'pending' AND expires_at > $3) OR (status = 'revoked' AND grant_id IS NOT NULL))
+         ORDER BY created_at ASC, request_id COLLATE "C" ASC`,
+        [orgId, sessionId, now],
+      );
+      await client.query("COMMIT");
+      const issues: McpTeamHostRequest[] = [];
+      const revocations: McpTeamHostRequest[] = [];
+      for (const entry of result.rows) {
+        if (entry.status === "pending") {
+          issues.push({
+            requestId: entry.request_id as string,
+            requesterUid: entry.requester_uid as string,
+            action: "issue",
+            expiresAt: Number(entry.expires_at),
+          });
+        } else {
+          revocations.push({
+            requestId: entry.request_id as string,
+            requesterUid: entry.requester_uid as string,
+            action: "revoke",
+            grantId: entry.grant_id as string,
+          });
+        }
+      }
+      return { issues, revocations };
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async reportMcpTeamGrant(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    requestId: string,
+    report: McpTeamGrantReport,
+    now = Date.now(),
+  ): Promise<McpTeamReportResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.lockTeamSession(client, orgId, sessionId);
+      const found = await client.query<Row>(
+        `SELECT * FROM sessions WHERE org_id = $1 AND id = $2 FOR UPDATE`,
+        [orgId, sessionId],
+      );
+      const row = found.rows[0];
+      if (!row || row.closed_at !== null || !teamPublisher(toSession(row, []), orgId, ownerUid, deviceId)) {
+        await client.query("ROLLBACK");
+        return "missing";
+      }
+      const state = await client.query<Row>(
+        `SELECT * FROM mcp_team_grants WHERE org_id = $1 AND session_id = $2 AND request_id = $3 FOR UPDATE`,
+        [orgId, sessionId, requestId],
+      );
+      const entry = state.rows[0];
+      if (!entry) {
+        await client.query("ROLLBACK");
+        return "missing";
+      }
+      if (entry.status === "issued") {
+        /* A retry: the first grant stands, and a re-minted one runs out alone. */
+        await client.query("COMMIT");
+        return "stored";
+      }
+      if (entry.status === "revoked") {
+        await client.query("ROLLBACK");
+        return "revoked";
+      }
+      if (Number(entry.expires_at) <= now) {
+        await client.query(
+          `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3 WHERE org_id = $1 AND session_id = $2 AND request_id = $4`,
+          [orgId, sessionId, now, requestId],
+        );
+        await client.query("COMMIT");
+        return "expired";
+      }
+      const member = await client.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM memberships WHERE org_id = $1 AND uid = $2`,
+        [orgId, entry.requester_uid],
+      );
+      if ((member.rows[0]?.count ?? 0) === 0 || row.mcp_team_access !== true) {
+        await client.query(
+          `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3 WHERE org_id = $1 AND session_id = $2 AND request_id = $4`,
+          [orgId, sessionId, now, requestId],
+        );
+        await client.query("COMMIT");
+        return "revoked";
+      }
+      const sealed = await sealTeamBearer(
+        entry.recipient_public_key as string, sessionId, entry.requester_uid as string, requestId, report.bearer,
+      );
+      await client.query(
+        `UPDATE mcp_team_grants
+         SET status = 'issued', grant_id = $3, grant_expires_at = $4, bearer = $5,
+             sealed_to_recipient = $6, issued_at = $7
+         WHERE org_id = $1 AND session_id = $2 AND request_id = $8`,
+        [orgId, sessionId, report.grantId, report.expiresAt, sealed, true, now, requestId],
+      );
+      await this.trimMcpTeamRows(client, now);
+      await client.query("COMMIT");
+      return "stored";
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async ackMcpTeamRevocation(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    requestId: string,
+    now = Date.now(),
+  ): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.lockTeamSession(client, orgId, sessionId);
+      const found = await client.query<Row>(
+        `SELECT * FROM sessions WHERE org_id = $1 AND id = $2 FOR UPDATE`,
+        [orgId, sessionId],
+      );
+      const row = found.rows[0];
+      if (!row || !teamPublisher(toSession(row, []), orgId, ownerUid, deviceId)) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      await this.trimMcpTeamRows(client, now);
+      const result = await client.query(
+        `DELETE FROM mcp_team_grants
+         WHERE org_id = $1 AND session_id = $2 AND request_id = $3 AND status = 'revoked' AND grant_id IS NOT NULL`,
+        [orgId, sessionId, requestId],
+      );
+      await client.query("COMMIT");
+      return (result.rowCount ?? 0) > 0;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* The original failure stands. */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async revokeMcpTeamSession(orgId: string, sessionId: string, now = Date.now()): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3
+       WHERE org_id = $1 AND session_id = $2 AND status <> 'revoked'`,
+      [orgId, sessionId, now],
+    );
+    if ((result.rowCount ?? 0) > 0) await this.purgeTeamRows(now);
+  }
+
+  async revokeMcpTeamMember(orgId: string, requesterUid: string, now = Date.now()): Promise<void> {
+    const result = await this.pool.query(
+      `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3
+       WHERE org_id = $1 AND requester_uid = $2 AND status <> 'revoked'`,
+      [orgId, requesterUid, now],
+    );
+    if ((result.rowCount ?? 0) > 0) await this.purgeTeamRows(now);
+  }
+
+  /** The opportunistic sweep outside a transaction, for the revocation hooks. */
+  private async purgeTeamRows(now: number): Promise<void> {
+    await this.pool.query(
+      `DELETE FROM mcp_team_grants
+       WHERE (status = 'pending' AND expires_at <= $1::bigint - 3600000)
+          OR (status = 'revoked' AND COALESCE(revoked_at, created_at) <= $1::bigint - 3600000)
+          OR (status = 'issued' AND COALESCE(grant_expires_at, created_at) <= $1::bigint - 3600000)`,
+      [now],
+    );
+  }
+
+  async teamAuthorization(sessionId: string, requesterUid: string, grantId: string, now = Date.now()): Promise<boolean> {
+    const client = await this.pool.connect();
+    try {
+      const rows = await client.query<Row>(
+        `SELECT org_id, closed_at, mcp_team_access FROM sessions WHERE id = $1`,
+        [sessionId],
+      );
+      if (rows.rows.length === 0) return false;
+      for (const row of rows.rows) {
+        if (row.closed_at !== null || row.mcp_team_access !== true) return false;
+        const member = await client.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM memberships WHERE org_id = $1 AND uid = $2`,
+          [row.org_id, requesterUid],
+        );
+        if ((member.rows[0]?.count ?? 0) === 0) return false;
+        const grant = await client.query<{ count: number }>(
+          `SELECT count(*)::int AS count FROM mcp_team_grants
+           WHERE org_id = $1 AND session_id = $2 AND requester_uid = $3 AND grant_id = $4
+             AND status = 'issued' AND grant_expires_at > $5`,
+          [row.org_id, sessionId, requesterUid, grantId, now],
+        );
+        if ((grant.rows[0]?.count ?? 0) === 0) return false;
+      }
+      return true;
+    } finally {
+      client.release();
+    }
+  }
+
   async upsertSession(session: SessionRecord): Promise<boolean> {
     /*
      * `xmax = 0` distinguishes an insert from an update on the conflicting
@@ -1075,6 +1849,23 @@ export class PostgresStore implements Store {
     if (session.keyShares?.length) {
       await this.writeShares(session.uid, session.id, session.keyShares);
     }
+    /*
+     * A snapshot is bound to one incarnation under one owner. Clean anything
+     * the current row no longer matches, so a restart or a handoff invalidates
+     * the old run's snapshot in the same call, with no intervening read.
+     */
+    await this.pool.query(
+      `DELETE FROM jev_assessments ja
+       WHERE ja.session_id = $1 AND ja.org_id = $2
+         AND NOT EXISTS (
+           SELECT 1 FROM sessions s
+           WHERE s.id = ja.session_id AND s.org_id = ja.org_id
+             AND COALESCE(s.owner_uid, s.uid) = ja.owner_uid
+             AND s.started_at = ja.started_at
+             AND s.closed_at IS NULL
+         )`,
+      [session.id, session.orgId ?? null],
+    );
     return row?.inserted === true;
   }
 
@@ -1134,6 +1925,18 @@ export class PostgresStore implements Store {
         id,
         ...set.values,
       ]);
+    }
+    if (["closedAt", "ownerUid", "startedAt"].some((key) => key in columns)) {
+      /*
+       * A close, a handoff or a new incarnation invalidates the snapshot in
+       * the same call, so a later reopen or handback cannot resurrect it.
+       */
+      await this.pool.query(
+        `DELETE FROM jev_assessments
+         WHERE session_id = $2
+           AND org_id = COALESCE((SELECT org_id FROM sessions WHERE uid = $1 AND id = $2), '')`,
+        [uid, id],
+      );
     }
     if (keyShares?.length) await this.writeShares(uid, id, keyShares);
     const row = await this.row("SELECT * FROM sessions WHERE uid = $1 AND id = $2", [uid, id]);
@@ -1198,22 +2001,35 @@ export class PostgresStore implements Store {
     ownerUid: string,
     consent: Partial<SessionAutomationConsent>,
   ): Promise<SessionRecord | null> {
-    const row = await this.row(
-      `UPDATE sessions
-       SET mcp_team_access = COALESCE($4::boolean, mcp_team_access),
-           daily_briefing_enabled = COALESCE($5::boolean, daily_briefing_enabled),
-           daily_briefing_team_access = COALESCE($6::boolean, daily_briefing_team_access)
-       WHERE org_id = $1 AND id = $2 AND COALESCE(owner_uid, uid) = $3
-       RETURNING *`,
-      [
-        orgId,
-        sessionId,
-        ownerUid,
-        consent.mcpTeamAccess,
-        consent.dailyBriefingEnabled,
-        consent.dailyBriefingTeamAccess,
-      ],
-    );
+    const client = await this.pool.connect();
+    let row: Row | undefined;
+    try {
+      await client.query("BEGIN");
+      // Match request/report lock order: global, session advisory, session row.
+      await this.lockTeamSession(client, orgId, sessionId);
+      const updated = await client.query<Row>(
+        `UPDATE sessions
+         SET mcp_team_access = COALESCE($4::boolean, mcp_team_access),
+             daily_briefing_enabled = COALESCE($5::boolean, daily_briefing_enabled),
+             daily_briefing_team_access = COALESCE($6::boolean, daily_briefing_team_access)
+         WHERE org_id = $1 AND id = $2 AND COALESCE(owner_uid, uid) = $3 RETURNING *`,
+        [orgId, sessionId, ownerUid, consent.mcpTeamAccess, consent.dailyBriefingEnabled, consent.dailyBriefingTeamAccess],
+      );
+      row = updated.rows[0];
+      if (row && consent.mcpTeamAccess === false) {
+        await client.query(
+          `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3, bearer = NULL
+           WHERE org_id = $1 AND session_id = $2 AND status <> 'revoked'`,
+          [orgId, sessionId, Date.now()],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { /* Preserve the failure. */ }
+      throw error;
+    } finally {
+      client.release();
+    }
     return row ? (await this.hydrate([row]))[0] : null;
   }
 
@@ -1287,10 +2103,13 @@ export class PostgresStore implements Store {
    * is an audited act and the record of it outlives the subject.
    */
   async deleteSession(orgId: string, id: string): Promise<boolean> {
+    /* A snapshot does not outlive the session row it was bound to. */
+    await this.pool.query("DELETE FROM jev_assessments WHERE org_id = $1 AND session_id = $2", [orgId, id]);
     const result = await this.pool.query("DELETE FROM sessions WHERE org_id = $1 AND id = $2", [
       orgId,
       id,
     ]);
+    if ((result.rowCount ?? 0) > 0) await this.revokeMcpTeamSession(orgId, id);
     return (result.rowCount ?? 0) > 0;
   }
 
@@ -1405,9 +2224,35 @@ export class PostgresStore implements Store {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Serialize with team request/issue/consent transactions before taking
+      // session or membership row locks. Capture ownership before deletion or
+      // reassignment removes the binding needed to invalidate these grants.
+      await client.query("SELECT pg_advisory_xact_lock($1)", [MCP_TEAM_GLOBAL_LOCK]);
+      await client.query(
+        `UPDATE mcp_team_grants r
+         SET status = 'revoked', revoked_at = $3, bearer = NULL
+         WHERE r.requester_uid = $1
+            OR ($2::text IS NOT NULL AND r.org_id = $2)
+            OR EXISTS (
+              SELECT 1 FROM sessions s
+              WHERE s.org_id = r.org_id AND s.id = r.session_id
+                AND (s.uid = $1 OR s.owner_uid = $1)
+            )`,
+        [uid, plan.orgId && plan.dissolve ? plan.orgId : null, now],
+      );
       if (plan.orgId && plan.dissolve) {
         /* Key shares go with their sessions, through the foreign key's cascade. */
-        for (const table of ["sessions", "audit_events", "comments", "notifications", "invites", "memberships"]) {
+        for (const table of [
+          "sessions",
+          "audit_events",
+          "comments",
+          "notifications",
+          "invites",
+          "memberships",
+          "external_analysis_consents",
+          "jev_assessments",
+          "jev_budget",
+        ]) {
           await client.query(`DELETE FROM ${table} WHERE org_id = $1`, [plan.orgId]);
         }
         await client.query("DELETE FROM organizations WHERE id = $1", [plan.orgId]);
@@ -1429,6 +2274,10 @@ export class PostgresStore implements Store {
         "DELETE FROM account_activity WHERE uid = $1",
         /* The keep goes with the account. It is nobody else's progress. */
         "DELETE FROM game_profiles WHERE uid = $1",
+        /* Jev state is account-scoped: it goes with the account. */
+        "DELETE FROM external_analysis_consents WHERE owner_uid = $1",
+        "DELETE FROM jev_assessments WHERE owner_uid = $1",
+        "DELETE FROM jev_budget WHERE owner_uid = $1",
         "DELETE FROM comments WHERE author_uid = $1",
         "DELETE FROM notifications WHERE uid = $1 OR actor_uid = $1",
         /* The address an invite was sent to is theirs once they accepted it. */
@@ -1443,6 +2292,17 @@ export class PostgresStore implements Store {
       ]) {
         await client.query(statement, [uid]);
       }
+      /* A session that just lost its owner must not keep the old run's rows,
+         even outside the dissolve path. */
+      await client.query(
+        `DELETE FROM jev_assessments ja
+         WHERE NOT EXISTS (
+           SELECT 1 FROM sessions s
+           WHERE s.id = ja.session_id AND s.org_id = ja.org_id
+             AND COALESCE(s.owner_uid, s.uid) = ja.owner_uid
+             AND s.closed_at IS NULL
+         )`,
+      );
       await client.query("UPDATE audit_events SET actor_email = $2 WHERE actor_uid = $1", [
         uid,
         DELETED_ACTOR_EMAIL,
@@ -1702,6 +2562,12 @@ export class PostgresStore implements Store {
            WHERE keys.session_uid = sessions.uid AND keys.session_id = sessions.id
              AND sessions.org_id = $1 AND keys.uid = $2`,
           [orgId, uid],
+        );
+        /* A listing is not a connection: their live team requests go with them. */
+        await client.query(
+          `UPDATE mcp_team_grants SET status = 'revoked', revoked_at = $3
+           WHERE org_id = $1 AND requester_uid = $2 AND status <> 'revoked'`,
+          [orgId, uid, Date.now()],
         );
       }
       await client.query("COMMIT");
@@ -2229,6 +3095,10 @@ export class PostgresStore implements Store {
     ]);
     /* Flow rows are a live feed: the purge is what keeps the table a feed. */
     await this.pool.query("DELETE FROM mcp_flows WHERE expires_at <= $1", [now]);
+    /* Assessment rows are short-lived the same way; budget rows age out of
+       the sliding window. */
+    await this.pool.query("DELETE FROM jev_assessments WHERE expires_at <= $1", [now]);
+    await this.pool.query("DELETE FROM jev_budget WHERE at <= $1", [now - JEV_BUDGET.windowMs]);
   }
 
   async close(): Promise<void> {

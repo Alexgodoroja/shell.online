@@ -12,7 +12,22 @@ import {
   type McpFlowEvent,
   type McpFlowRow,
 } from "./mcp-flows";
-import type { Invite, Membership, Organization, Role } from "./orgs";
+import { JEV_BUDGET, JEV_MAX_SNAPSHOTS } from "./jev/limits";
+import type { AssessmentSnapshot, JevConsent } from "./jev/integration";
+import {
+  MCP_TEAM_REQUEST_TTL,
+  MCP_TEAM_PENDING_LIMIT,
+  MCP_TEAM_GLOBAL_LIMIT,
+  sealTeamBearer,
+  trimMcpTeamRows,
+  teamPublisher,
+  type McpTeamGrantReport,
+  type McpTeamHostRequest,
+  type McpTeamRequest,
+  type McpTeamReportResult,
+  type McpTeamRequestResult,
+} from "./mcp-team";
+import { newId, type Invite, type Membership, type Organization, type Role } from "./orgs";
 import {
   ACCOUNT_ACTIVITY_MEMORY_MS,
   DAY_MS,
@@ -77,6 +92,10 @@ function isSealed(text: string): boolean {
 interface Shape {
   sessionContent: { sessionUid: string; sessionId: string; generation: string; content?: SessionContent; publishedAt?: number }[];
   mcpFlows: McpFlowRow[];
+  jevConsents: { orgId: string; ownerUid: string; externalAnalysis: boolean; updatedAt: number; updatedBy: string }[];
+  jevAssessments: { orgId: string; ownerUid: string; sessionId: string; startedAt: number; snapshot: AssessmentSnapshot }[];
+  jevBudget: { orgId: string; ownerUid: string; at: number; chars: number }[];
+  mcpTeamGrants: McpTeamRequest[];
   codes: AuthorizationCode[];
   tokens: CliToken[];
   sessions: SessionRecord[];
@@ -101,6 +120,8 @@ interface Shape {
 const EMPTY: Shape = {
   sessionContent: [],
   mcpFlows: [],
+  jevConsents: [], jevAssessments: [], jevBudget: [],
+  mcpTeamGrants: [],
   codes: [], tokens: [], sessions: [], commands: [],
   organizations: [], memberships: [], invites: [], audit: [],
   comments: [], notifications: [], feedback: [], accountKeys: [], deletedAccounts: [],
@@ -175,6 +196,10 @@ export class MemoryStore implements Store {
         sessions: parsed.sessions ?? [],
         sessionContent: parsed.sessionContent ?? [],
         mcpFlows: parsed.mcpFlows ?? [],
+        jevConsents: parsed.jevConsents ?? [],
+        jevAssessments: parsed.jevAssessments ?? [],
+        jevBudget: parsed.jevBudget ?? [],
+        mcpTeamGrants: parsed.mcpTeamGrants ?? [],
         commands: parsed.commands ?? [],
         organizations: parsed.organizations ?? [],
         memberships: parsed.memberships ?? [],
@@ -353,6 +378,27 @@ export class MemoryStore implements Store {
   async deleteAccount(uid: string, plan: AccountDeletion, now = Date.now()): Promise<void> {
     const data = this.data;
     const { orgId } = plan;
+    /*
+     * Revocation must survive recreating the account or session. Capture the
+     * affected session identities before deletion or ownership reassignment,
+     * and retain grant ids only so a remaining host can finish relay cleanup.
+     */
+    const revokedTeamSessions = new Set(
+      data.sessions
+        .filter((session) => session.uid === uid || session.ownerUid === uid)
+        .map((session) => `${session.orgId}\u0000${session.id}`),
+    );
+    for (const request of data.mcpTeamGrants) {
+      if (
+        request.requesterUid === uid ||
+        (orgId && plan.dissolve && request.orgId === orgId) ||
+        revokedTeamSessions.has(`${request.orgId}\u0000${request.sessionId}`)
+      ) {
+        request.status = "revoked";
+        request.revokedAt = now;
+        request.bearer = undefined;
+      }
+    }
     if (orgId && plan.dissolve) {
       data.organizations = data.organizations.filter((entry) => entry.id !== orgId);
       data.memberships = data.memberships.filter((entry) => entry.orgId !== orgId);
@@ -362,6 +408,26 @@ export class MemoryStore implements Store {
       data.comments = data.comments.filter((entry) => entry.orgId !== orgId);
       data.notifications = data.notifications.filter((entry) => entry.orgId !== orgId);
     }
+    /*
+     * Jev state is account-scoped consent plus what it produced. It goes with
+     * the account, and with the organization when that is dissolved; sessions
+     * that lose their owner on the way lose their snapshots with them.
+     */
+    const orphanedSessions = new Set(
+      data.sessions.filter((session) => session.ownerUid === uid).map((session) => session.id),
+    );
+    data.jevConsents = data.jevConsents.filter(
+      (entry) => entry.ownerUid !== uid && !(plan.dissolve && entry.orgId === orgId),
+    );
+    data.jevAssessments = data.jevAssessments.filter(
+      (entry) =>
+        entry.ownerUid !== uid &&
+        !(plan.dissolve && entry.orgId === orgId) &&
+        !(entry.orgId === orgId && orphanedSessions.has(entry.sessionId)),
+    );
+    data.jevBudget = data.jevBudget.filter(
+      (entry) => entry.ownerUid !== uid && !(plan.dissolve && entry.orgId === orgId),
+    );
     if (orgId && plan.successorUid) {
       const successor = data.memberships.find(
         (entry) => entry.orgId === orgId && entry.uid === plan.successorUid,
@@ -584,6 +650,363 @@ export class MemoryStore implements Store {
       }));
   }
 
+  /* ---- External analysis (Jev) ---- */
+
+  async jevConsent(orgId: string, ownerUid: string): Promise<JevConsent | null> {
+    const row = this.data.jevConsents.find((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid);
+    return row ? { externalAnalysis: row.externalAnalysis, updatedAt: row.updatedAt, updatedBy: row.updatedBy } : null;
+  }
+
+  async putJevConsent(
+    orgId: string,
+    ownerUid: string,
+    enabled: boolean,
+    updatedBy: string,
+    expectedUpdatedAt: number | null,
+    now = Date.now(),
+  ): Promise<JevConsent | null> {
+    const index = this.data.jevConsents.findIndex((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid);
+    const existing = index >= 0 ? this.data.jevConsents[index] : null;
+    if ((existing?.updatedAt ?? null) !== expectedUpdatedAt) return null;
+    const updatedAt = Math.max(now, (existing?.updatedAt ?? 0) + 1);
+    const row = { orgId, ownerUid, externalAnalysis: enabled, updatedAt, updatedBy };
+    if (index >= 0) this.data.jevConsents[index] = row;
+    else this.data.jevConsents.push(row);
+    /* Revocation deletes every cached result as part of the same change, so
+       no reader depends on remembering to purge afterwards. */
+    if (!enabled) {
+      this.data.jevAssessments = this.data.jevAssessments.filter(
+        (entry) => entry.orgId !== orgId || entry.ownerUid !== ownerUid,
+      );
+    }
+    this.flush();
+    return { externalAnalysis: enabled, updatedAt, updatedBy };
+  }
+
+  async consumeJevBudget(orgId: string, ownerUid: string, chars: number, now = Date.now()): Promise<boolean> {
+    const cutoff = now - JEV_BUDGET.windowMs;
+    this.data.jevBudget = this.data.jevBudget.filter((entry) => entry.at > cutoff);
+    const window = this.data.jevBudget.filter((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid);
+    const spent = window.reduce((sum, entry) => sum + entry.chars, 0);
+    const cost = Math.max(0, Math.floor(chars));
+    if (window.length >= JEV_BUDGET.maxRequests || spent + cost > JEV_BUDGET.maxInputChars) {
+      this.flush();
+      return false;
+    }
+    this.data.jevBudget.push({ orgId, ownerUid, at: now, chars: cost });
+    this.flush();
+    return true;
+  }
+
+  async putJevAssessment(
+    orgId: string,
+    ownerUid: string,
+    snapshot: AssessmentSnapshot,
+    expectedUpdatedAt: number,
+  ): Promise<boolean> {
+    const consent = this.data.jevConsents.find((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid);
+    if (!consent?.externalAnalysis || consent.updatedAt !== expectedUpdatedAt) return false;
+    const session = this.data.sessions.find(
+      (entry) =>
+        entry.id === snapshot.sessionId &&
+        entry.orgId === orgId &&
+        (entry.ownerUid ?? entry.uid) === ownerUid &&
+        entry.closedAt === undefined,
+    );
+    if (!session) return false;
+    const row = { orgId, ownerUid, sessionId: snapshot.sessionId, startedAt: session.startedAt, snapshot: structuredClone(snapshot) };
+    const index = this.data.jevAssessments.findIndex(
+      (entry) => entry.orgId === orgId && entry.ownerUid === ownerUid && entry.sessionId === snapshot.sessionId,
+    );
+    if (index >= 0) this.data.jevAssessments[index] = row;
+    else this.data.jevAssessments.push(row);
+    const mine = this.data.jevAssessments.filter((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid);
+    if (mine.length > JEV_MAX_SNAPSHOTS) {
+      const excess = mine
+        .sort(byTime((entry) => entry.snapshot.observedAt, (entry) => entry.sessionId))
+        .slice(0, mine.length - JEV_MAX_SNAPSHOTS);
+      for (const drop of excess) {
+        const at = this.data.jevAssessments.indexOf(drop);
+        if (at >= 0) this.data.jevAssessments.splice(at, 1);
+      }
+    }
+    this.flush();
+    return true;
+  }
+
+  /*
+   * Team MCP grant requests. Single-threaded, so the session check and the
+   * write cannot interleave the way they can against a database; the check is
+   * still the same one the SQL store makes under its locks.
+   */
+  async requestMcpTeamGrant(
+    orgId: string,
+    sessionId: string,
+    requesterUid: string,
+    recipientPublicKey: string,
+    now = Date.now(),
+  ): Promise<{ result: McpTeamRequestResult; requestId?: string; expiresAt?: number }> {
+    const session = this.data.sessions.find(
+      (entry) => entry.id === sessionId && entry.orgId === orgId,
+    );
+    if (!session) return { result: "missing" };
+    if (session.closedAt !== undefined) return { result: "closed" };
+    if (session.mcpTeamAccess !== true) return { result: "disabled" };
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    if (this.data.mcpTeamGrants.length >= MCP_TEAM_GLOBAL_LIMIT) return { result: "limited" };
+    const pending = this.data.mcpTeamGrants.filter(
+      (row) => row.orgId === orgId && row.sessionId === sessionId && row.status === "pending" && row.expiresAt > now,
+    );
+    if (pending.length >= MCP_TEAM_PENDING_LIMIT) return { result: "limited" };
+    const requestId = newId("mcp");
+    const expiresAt = now + MCP_TEAM_REQUEST_TTL;
+    this.data.mcpTeamGrants.push({
+      requestId, orgId, sessionId, requesterUid, recipientPublicKey, status: "pending", createdAt: now, expiresAt, sealedToRecipient: false,
+    });
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    this.flush();
+    return { result: "stored", requestId, expiresAt };
+  }
+
+  async mcpTeamRequest(
+    orgId: string,
+    sessionId: string,
+    requesterUid: string,
+    requestId: string,
+    now = Date.now(),
+  ): Promise<McpTeamRequest | null> {
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    const row = this.data.mcpTeamGrants.find(
+      (entry) =>
+        entry.orgId === orgId &&
+        entry.sessionId === sessionId &&
+        entry.requesterUid === requesterUid &&
+        entry.requestId === requestId,
+    );
+    if (!row) return null;
+    const session = this.data.sessions.find((entry) => entry.id === sessionId && entry.orgId === orgId);
+    if (!session || session.closedAt !== undefined || session.mcpTeamAccess !== true ||
+        !this.data.memberships.some((entry) => entry.orgId === orgId && entry.uid === requesterUid) ||
+        (row.status === "issued" && (row.grantExpiresAt ?? 0) <= now)) {
+      row.status = "revoked";
+      row.revokedAt = now;
+      row.bearer = undefined;
+      this.flush();
+      return { ...row };
+    }
+    /*
+     * The credential is delivered exactly once, and it is out of the store the
+     * moment it is delivered: this fetch is the only one that ever sees it.
+     */
+    if (row.status === "issued" && row.bearer !== undefined && row.deliveredAt === undefined) {
+      const credential = row.bearer;
+      row.bearer = undefined;
+      row.deliveredAt = now;
+      this.flush();
+      return { ...row, bearer: credential };
+    }
+    this.flush();
+    return { ...row };
+  }
+
+  async listMcpTeamRequests(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    now = Date.now(),
+  ): Promise<{ issues: McpTeamHostRequest[]; revocations: McpTeamHostRequest[] } | null> {
+    const session = this.data.sessions.find(
+      (entry) => entry.id === sessionId && entry.orgId === orgId,
+    );
+    if (!session || session.closedAt !== undefined || !teamPublisher(session, orgId, ownerUid, deviceId)) return null;
+    /*
+     * Recheck every row against the world as it is now: a requester who left
+     * the organization, or a consent that just turned off, revokes on the way
+     * so this poll carries the revocation.
+     */
+    const members = new Set(this.data.memberships.filter((entry) => entry.orgId === orgId).map((entry) => entry.uid));
+    const consent = session.mcpTeamAccess === true;
+    for (const row of this.data.mcpTeamGrants) {
+      if (row.orgId !== orgId || row.sessionId !== sessionId || row.status === "revoked") continue;
+      if (!members.has(row.requesterUid) || !consent) {
+        row.status = "revoked";
+        row.revokedAt = now;
+      }
+    }
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    this.flush();
+    const issues: McpTeamHostRequest[] = [];
+    const revocations: McpTeamHostRequest[] = [];
+    for (const row of this.data.mcpTeamGrants) {
+      if (row.orgId !== orgId || row.sessionId !== sessionId) continue;
+      if (row.status === "pending" && row.expiresAt > now) {
+        issues.push({ requestId: row.requestId, requesterUid: row.requesterUid, action: "issue", expiresAt: row.expiresAt });
+      } else if (row.status === "revoked" && row.grantId) {
+        revocations.push({ requestId: row.requestId, requesterUid: row.requesterUid, action: "revoke", grantId: row.grantId });
+      }
+    }
+    return { issues, revocations };
+  }
+
+  async reportMcpTeamGrant(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    requestId: string,
+    report: McpTeamGrantReport,
+    now = Date.now(),
+  ): Promise<McpTeamReportResult> {
+    const session = this.data.sessions.find(
+      (entry) => entry.id === sessionId && entry.orgId === orgId,
+    );
+    if (!session || session.closedAt !== undefined || !teamPublisher(session, orgId, ownerUid, deviceId)) return "missing";
+    const row = this.data.mcpTeamGrants.find(
+      (entry) => entry.orgId === orgId && entry.sessionId === sessionId && entry.requestId === requestId,
+    );
+    if (!row) return "missing";
+    if (row.status === "issued") {
+      /* A retry: the first grant stands, and a re-minted one runs out alone. */
+      this.flush();
+      return "stored";
+    }
+    if (row.status === "revoked") return "revoked";
+    if (row.expiresAt <= now) {
+      row.status = "revoked";
+      row.revokedAt = now;
+      this.flush();
+      return "expired";
+    }
+    const member = this.data.memberships.find((entry) => entry.orgId === orgId && entry.uid === row.requesterUid);
+    if (!member || session.mcpTeamAccess !== true) {
+      row.status = "revoked";
+      row.revokedAt = now;
+      this.flush();
+      return "revoked";
+    }
+    const sealed = await sealTeamBearer(row.recipientPublicKey, sessionId, row.requesterUid, requestId, report.bearer);
+    // Crypto yields: consent, membership and the originating device can change.
+    const currentSession = this.data.sessions.find((entry) => entry.id === sessionId && entry.orgId === orgId);
+    if (!currentSession || currentSession.closedAt !== undefined ||
+        !teamPublisher(currentSession, orgId, ownerUid, deviceId) || currentSession.mcpTeamAccess !== true ||
+        !this.data.memberships.some((entry) => entry.orgId === orgId && entry.uid === row.requesterUid) ||
+        (row.status as string) === "revoked") return "revoked";
+    if ((row.status as string) === "issued") return "stored";
+    row.status = "issued";
+    row.grantId = report.grantId;
+    row.grantExpiresAt = report.expiresAt;
+    row.bearer = sealed;
+    row.sealedToRecipient = true;
+    row.issuedAt = now;
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    this.flush();
+    return "stored";
+  }
+
+  async ackMcpTeamRevocation(
+    orgId: string,
+    sessionId: string,
+    ownerUid: string,
+    deviceId: string,
+    requestId: string,
+    now = Date.now(),
+  ): Promise<boolean> {
+    const session = this.data.sessions.find(
+      (entry) => entry.id === sessionId && entry.orgId === orgId,
+    );
+    if (!session || !teamPublisher(session, orgId, ownerUid, deviceId)) return false;
+    this.data.mcpTeamGrants = trimMcpTeamRows(this.data.mcpTeamGrants, now);
+    const row = this.data.mcpTeamGrants.find(
+      (entry) => entry.orgId === orgId && entry.sessionId === sessionId && entry.requestId === requestId,
+    );
+    if (!row || row.status !== "revoked" || !row.grantId) return false;
+    this.data.mcpTeamGrants = this.data.mcpTeamGrants.filter((entry) => entry !== row);
+    this.flush();
+    return true;
+  }
+
+  async listJevAssessments(orgId: string, ownerUid: string, now = Date.now()): Promise<AssessmentSnapshot[]> {
+    const before = this.data.jevAssessments.length;
+    this.data.jevAssessments = this.data.jevAssessments.filter((entry) => {
+      if (entry.orgId !== orgId || entry.ownerUid !== ownerUid) return true;
+      if (entry.snapshot.expiresAt <= now) return false;
+      return this.data.sessions.some(
+        (session) =>
+          session.id === entry.sessionId &&
+          session.orgId === orgId &&
+          (session.ownerUid ?? session.uid) === ownerUid &&
+          session.startedAt === entry.startedAt &&
+          session.closedAt === undefined,
+      );
+    });
+    if (this.data.jevAssessments.length !== before) this.flush();
+    return this.data.jevAssessments
+      .filter((entry) => entry.orgId === orgId && entry.ownerUid === ownerUid && entry.snapshot.expiresAt > now)
+      .sort(byTime((entry) => entry.snapshot.observedAt, (entry) => entry.sessionId, true))
+      .slice(0, JEV_MAX_SNAPSHOTS)
+      .map((entry) => structuredClone(entry.snapshot));
+  }
+
+  async dropJevAssessments(orgId: string, ownerUid: string, sessionIds: string[]): Promise<number> {
+    const doomed = new Set(sessionIds);
+    const before = this.data.jevAssessments.length;
+    this.data.jevAssessments = this.data.jevAssessments.filter(
+      (entry) => !(entry.orgId === orgId && entry.ownerUid === ownerUid && doomed.has(entry.sessionId)),
+    );
+    const removed = before - this.data.jevAssessments.length;
+    if (removed > 0) this.flush();
+    return removed;
+  }
+
+  async clearJevAssessments(orgId: string, ownerUid: string): Promise<number> {
+    const before = this.data.jevAssessments.length;
+    this.data.jevAssessments = this.data.jevAssessments.filter(
+      (entry) => entry.orgId !== orgId || entry.ownerUid !== ownerUid,
+    );
+    const removed = before - this.data.jevAssessments.length;
+    if (removed > 0) this.flush();
+    return removed;
+  }
+
+  async revokeMcpTeamSession(orgId: string, sessionId: string, now = Date.now()): Promise<void> {
+    let changed = false;
+    for (const row of this.data.mcpTeamGrants) {
+      if (row.orgId === orgId && row.sessionId === sessionId && row.status !== "revoked") {
+        row.status = "revoked";
+        row.revokedAt = now;
+        changed = true;
+      }
+    }
+    if (changed) this.flush();
+  }
+
+  async revokeMcpTeamMember(orgId: string, requesterUid: string, now = Date.now()): Promise<void> {
+    let changed = false;
+    for (const row of this.data.mcpTeamGrants) {
+      if (row.orgId === orgId && row.requesterUid === requesterUid && row.status !== "revoked") {
+        row.status = "revoked";
+        row.revokedAt = now;
+        changed = true;
+      }
+    }
+    if (changed) this.flush();
+  }
+
+  async teamAuthorization(sessionId: string, requesterUid: string, grantId: string, now = Date.now()): Promise<boolean> {
+    const sessions = this.data.sessions.filter((entry) => entry.id === sessionId);
+    if (sessions.length === 0) return false;
+    for (const session of sessions) {
+      if (session.closedAt !== undefined || session.mcpTeamAccess !== true) return false;
+      const member = this.data.memberships.find((entry) => entry.orgId === session.orgId && entry.uid === requesterUid);
+      if (!member) return false;
+      if (!this.data.mcpTeamGrants.some((row) => row.orgId === session.orgId && row.sessionId === sessionId &&
+          row.requesterUid === requesterUid && row.grantId === grantId && row.status === "issued" &&
+          (row.grantExpiresAt ?? 0) > now)) return false;
+    }
+    return true;
+  }
+
   async upsertSession(session: SessionRecord): Promise<boolean> {
     const index = this.data.sessions.findIndex(
       (entry) => entry.id === session.id && entry.uid === session.uid,
@@ -592,6 +1015,18 @@ export class MemoryStore implements Store {
       const existing = this.data.sessions[index];
       if (existing.shareUrl !== session.shareUrl || existing.origin !== session.origin || existing.orgId !== session.orgId || existing.ownerUid !== session.ownerUid) this.invalidateContent(existing);
       const hadAssignment = existing.assigneeUids !== undefined;
+      /*
+       * A restart is a new incarnation (new started-at) and a handoff is a new
+       * owner; either invalidates the old incarnation's snapshot in the same
+       * step, so its id cannot serve a run that has ended.
+       */
+      const incarnationChanged = existing.startedAt !== session.startedAt;
+      const ownerChanged = session.ownerUid !== undefined && existing.ownerUid !== session.ownerUid;
+      if (incarnationChanged || ownerChanged) {
+        this.data.jevAssessments = this.data.jevAssessments.filter(
+          (entry) => entry.sessionId !== session.id || entry.orgId !== session.orgId,
+        );
+      }
       this.data.sessions[index] = {
         ...existing,
         ...session,
@@ -667,6 +1102,20 @@ export class MemoryStore implements Store {
     const session = this.data.sessions.find((entry) => entry.id === id && entry.uid === uid);
     if (!session) return null;
     if ((["dailyBriefingEnabled", "shareUrl", "origin", "ownerUid", "orgId"] as const).some((key) => key in patch && patch[key] !== session[key])) this.invalidateContent(session);
+    /*
+     * A snapshot belongs to one session incarnation under one owner. A close,
+     * an ownership change or a generation change invalidates it here, so a
+     * later reopen or handback cannot resurrect it with no intervening read.
+     */
+    if (
+      ("closedAt" in patch && patch.closedAt !== session.closedAt) ||
+      ("ownerUid" in patch && patch.ownerUid !== session.ownerUid) ||
+      ("startedAt" in patch && patch.startedAt !== session.startedAt)
+    ) {
+      this.data.jevAssessments = this.data.jevAssessments.filter(
+        (entry) => entry.orgId !== session.orgId || entry.sessionId !== id,
+      );
+    }
     Object.assign(session, patch);
     this.flush();
     return session;
@@ -723,7 +1172,15 @@ export class MemoryStore implements Store {
         (entry.ownerUid ?? entry.uid) === ownerUid,
     );
     if (!session) return null;
-    if (consent.mcpTeamAccess !== undefined) session.mcpTeamAccess = consent.mcpTeamAccess;
+    if (consent.mcpTeamAccess !== undefined) {
+      /*
+       * Consent off is a revocation, not just a closed door: live team
+       * requests on this session are marked so the machine's next poll
+       * carries the revocation.
+       */
+      if (session.mcpTeamAccess === true && consent.mcpTeamAccess === false) await this.revokeMcpTeamSession(orgId, sessionId);
+      session.mcpTeamAccess = consent.mcpTeamAccess;
+    }
     if (consent.dailyBriefingEnabled !== undefined) {
       if (!!session.dailyBriefingEnabled !== consent.dailyBriefingEnabled) this.invalidateContent(session);
       session.dailyBriefingEnabled = consent.dailyBriefingEnabled;
@@ -774,6 +1231,7 @@ export class MemoryStore implements Store {
   async deleteSession(orgId: string, id: string): Promise<boolean> {
     const deleted = this.data.sessions.find((item) => item.orgId === orgId && item.id === id);
     if (deleted) this.data.sessionContent = this.data.sessionContent.filter((item) => item.sessionUid !== deleted.uid || item.sessionId !== id);
+    await this.revokeMcpTeamSession(orgId, id);
     const before = this.data.sessions.length;
     this.data.sessions = this.data.sessions.filter(
       (entry) => !(entry.id === id && entry.orgId === orgId),
@@ -784,6 +1242,10 @@ export class MemoryStore implements Store {
      * record nothing worth keeping.
      */
     if (this.data.sessions.length === before) return false;
+    /* A snapshot does not outlive the session row it was bound to. */
+    this.data.jevAssessments = this.data.jevAssessments.filter(
+      (entry) => entry.orgId !== orgId || entry.sessionId !== id,
+    );
     this.flush();
     return true;
   }
@@ -913,6 +1375,8 @@ export class MemoryStore implements Store {
       (entry) => !(entry.orgId === orgId && entry.uid === uid),
     );
     if (this.data.memberships.length === before) return false;
+    /* A listing is not a connection: their live team requests go with them. */
+    await this.revokeMcpTeamMember(orgId, uid);
     for (const session of this.data.sessions) {
       if (session.orgId === orgId && session.keyShares) {
         session.keyShares = session.keyShares.filter((share) => share.uid !== uid);
@@ -1210,11 +1674,18 @@ export class MemoryStore implements Store {
     /* Flow rows are a live feed: the purge is what keeps the table a feed. */
     const flowsBefore = this.data.mcpFlows.length;
     this.data.mcpFlows = trimMcpFlowRows(this.data.mcpFlows, now);
+    /* Assessments are short-lived by construction; expired rows are unservable. */
+    const assessmentsBefore = this.data.jevAssessments.length;
+    this.data.jevAssessments = this.data.jevAssessments.filter((entry) => entry.snapshot.expiresAt > now);
+    const budgetBefore = this.data.jevBudget.length;
+    this.data.jevBudget = this.data.jevBudget.filter((entry) => entry.at > now - JEV_BUDGET.windowMs);
     if (
       this.data.codes.length !== before ||
       this.data.commands.length !== commandsBefore ||
       this.data.deletedAccounts.length !== deletedBefore ||
-      this.data.mcpFlows.length !== flowsBefore
+      this.data.mcpFlows.length !== flowsBefore ||
+      this.data.jevAssessments.length !== assessmentsBefore ||
+      this.data.jevBudget.length !== budgetBefore
     ) {
       this.flush();
     }

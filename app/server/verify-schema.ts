@@ -34,6 +34,7 @@ const REQUIRED_TABLES = [
   "cli_tokens",
   "comments",
   "deleted_accounts",
+  "external_analysis_consents",
   "feedback",
   /*
    * The game's two. The Worker serves /api/game, /api/game/runs and the
@@ -43,7 +44,10 @@ const REQUIRED_TABLES = [
   "game_collection_runs",
   "game_profiles",
   "invites",
+  "jev_assessments",
+  "jev_budget",
   "memberships",
+  "mcp_team_grants",
   "notifications",
   "organizations",
   "schema_migrations",

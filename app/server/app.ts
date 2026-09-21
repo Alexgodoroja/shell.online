@@ -60,6 +60,10 @@ import { callerAddress, rateLimiter } from "./lib/rate-limit";
 import { logMailer, type Mailer } from "./lib/mail";
 import { readSessionContent } from "./lib/session-content";
 import { readMcpFlows } from "./lib/mcp-flows";
+import { createJevIntegration } from "./lib/jev/integration";
+import { readJevAssessRequest } from "./lib/jev/request";
+import { jevStoreHooks } from "./lib/jev/store-adapter";
+import { readTeamGrantReport } from "./lib/mcp-team";
 
 export interface AppOptions {
   store: Store;
@@ -95,6 +99,18 @@ export interface AppOptions {
    * exist. At least 32 characters; see readConfig.
    */
   statsToken?: string;
+  /**
+   * The server-only external-analysis credential. Absent means the optional
+   * Jev assessment is unavailable; it is never read from a client, never
+   * returned to one, and never part of a browser bundle.
+   */
+  jevApiKey?: string | null;
+  /**
+   * Lets the relay's DO re-authorize a team MCP grant at use time: the live
+   * membership/consent check. Absent means the route does not exist, and the
+   * DO fails team grants closed. At least 32 characters; see readConfig.
+   */
+  mcpTeamCheckToken?: string;
   /**
    * Accounts the statistics dashboard leaves out of every figure: ours, not
    * customers'. Addresses and domains; see internal-accounts.ts.
@@ -404,6 +420,28 @@ export function createApp(options: AppOptions) {
   const credentialLimit = rateLimiter(CREDENTIAL_BUCKET);
   const generalLimit = rateLimiter(GENERAL_BUCKET);
   const feedbackLimit = rateLimiter(FEEDBACK_BUCKET);
+  /*
+   * Advisory external analysis, inert without a deployment secret and the
+   * owner's separate consent. The stores own every predicate; this object
+   * only sequences them.
+   */
+  const jev = createJevIntegration({
+    env: { JEV_API_KEY: options.jevApiKey ?? null },
+    store: jevStoreHooks(store),
+  });
+
+  /* How each refusal from the external-analysis path is reported. Never the
+     upstream body, never a distinguishing detail beyond the reason code. */
+  const JEV_STATUS: Record<string, number> = {
+    not_configured: 409, unavailable: 409, budget_unavailable: 409,
+    consent_required: 403, access_denied: 404,
+    consent_revoked: 409, access_revoked: 409,
+    budget_exceeded: 429, rate_capped: 429, rate_limited: 429, busy: 409, overloaded: 503,
+    timeout: 504,
+    provider_error: 502, redirect_refused: 502, unauthorized: 502,
+    invalid_request: 502, malformed: 502,
+    state_out_of_bounds: 400, questions_out_of_bounds: 400,
+  };
 
   async function sessionsForMember(membership: Membership, sessions: SessionRecord[]) {
     const states = options.sessionLiveness
@@ -717,6 +755,176 @@ export function createApp(options: AppOptions) {
         const devices = await store.listDevices(membership.uid);
         const activeDevices = new Set(devices.filter((device) => device.revokedAt === undefined).map((device) => device.id));
         return send(response, 200, { flows: await store.listMcpFlows(membership.orgId, membership.uid, activeDevices) });
+      }
+
+      /*
+       * External analysis: the owner's separate consent (off by default and
+       * distinct from every other consent) and the advisory assessments
+       * stored from it. Responses carry the snapshot shape only: inferred
+       * labels with their source age, never a completion claim, never an
+       * action a client could take.
+       */
+      if (route === "GET /api/game/assessments") {
+        const membership = await requireMember(request);
+        if (!membership) return send(response, 401, { error: "sign in first" });
+        const consent = await jev.getConsent(membership.orgId, membership.uid);
+        return send(response, 200, {
+          configured: jev.configured,
+          consent: { externalAnalysis: consent.externalAnalysis, updatedAt: consent.updatedAt },
+          assessments: await jev.list(membership.orgId, membership.uid),
+        });
+      }
+
+      if (route === "PUT /api/game/assessments/consent") {
+        const membership = await requireMember(request);
+        if (!membership) return send(response, 401, { error: "sign in first" });
+        const body = (await readBody(request)) as Record<string, unknown>;
+        if (typeof body.enabled !== "boolean") {
+          return send(response, 400, { error: "expected { enabled: boolean }" });
+        }
+        const saved = await jev.putConsent(membership.orgId, membership.uid, body.enabled, membership.uid);
+        if (!saved.ok) return send(response, 409, { error: saved.reason });
+        return send(response, 200, {
+          externalAnalysis: saved.consent.externalAnalysis,
+          updatedAt: saved.consent.updatedAt,
+        });
+      }
+
+      /*
+       * A user-initiated assessment for one session the caller owns. The
+       * excerpt is disclosed from a pane the owner already has open and
+       * decrypted in their own browser; the service decrypts nothing itself
+       * and stores no excerpt. The integration rechecks consent and
+       * ownership before the outbound request and the store's predicate
+       * rechecks them again before anything is written.
+       */
+      const jevAssessRoute = url.pathname.match(/^\/api\/game\/sessions\/([A-Za-z0-9_-]{6,64})\/assess$/);
+      if (request.method === "POST" && jevAssessRoute) {
+        const membership = await requireMember(request);
+        if (!membership) return send(response, 401, { error: "sign in first" });
+        const session = await store.sessionInOrg(membership.orgId, jevAssessRoute[1]);
+        /* Owner only: the consent is the owner's and so is the pane. */
+        if (!session || !ownsSession(membership, session)) {
+          return send(response, 404, { error: "no such session" });
+        }
+        const parsed = readJevAssessRequest(await readBody(request));
+        if (!parsed) return send(response, 400, { error: "invalid assessment request" });
+        const result = await jev.assess({
+          orgId: membership.orgId,
+          ownerUid: membership.uid,
+          sessionId: session.id,
+          generation: parsed.generation,
+          excerpt: parsed.excerpt,
+          repeatCount: parsed.repeatCount,
+          observed: parsed.observed,
+        });
+        if (!result.ok) return send(response, JEV_STATUS[result.reason] ?? 502, { error: result.reason });
+        return send(response, 200, { assessment: result.snapshot });
+      }
+
+      /*
+       * Team MCP grant requests. A teammate asks for an observe-only grant on
+       * a session whose owner opted into team MCP; the session's own machine
+       * answers through the existing host-token path and reports the opaque
+       * bearer back. Listing a session is not a connection: the request is
+       * refused while the consent is off, and only the requester ever reads
+       * their own answer.
+       */
+      const teamGrantRoute = url.pathname.match(/^\/api\/(cli\/)?sessions\/([A-Za-z0-9_-]{6,64})\/mcp\/team(\/([A-Za-z0-9_-]{6,64}))?$/);
+      if (teamGrantRoute) {
+        const viaCli = teamGrantRoute[1] === "cli/";
+        const sessionId = teamGrantRoute[2];
+        const requestId = teamGrantRoute[4];
+        let membership: Membership | null = null;
+        if (viaCli) {
+          const token = await requireCli(request);
+          if (!token) return send(response, 401, { error: "not signed in" });
+          membership = await store.membershipOf(token.uid);
+          if (!membership) return send(response, 404, { error: "no such session" });
+        } else {
+          membership = await requireMember(request);
+          if (!membership) return send(response, 401, { error: "sign in first" });
+        }
+        if (request.method === "POST" && !requestId) {
+          const body = (await readBody(request)) as Record<string, unknown>;
+          if (!body || Object.keys(body).some((key) => key !== "recipientPublicKey") ||
+              !(await isP256PublicKey(body.recipientPublicKey))) {
+            return send(response, 400, { error: "a valid recipient public key is required" });
+          }
+          const answer = await store.requestMcpTeamGrant(membership.orgId, sessionId, membership.uid, body.recipientPublicKey as string);
+          const status = { stored: 201, missing: 404, closed: 404, disabled: 403, limited: 429 }[answer.result];
+          if (answer.result !== "stored") {
+            const error = answer.result === "disabled"
+              ? "team MCP is not enabled for this session"
+              : answer.result === "limited"
+                ? "too many pending team MCP requests"
+                : "no such session";
+            return send(response, status, { error });
+          }
+          return send(response, 201, { requestId: answer.requestId, expiresAt: answer.expiresAt });
+        }
+        if (request.method === "GET" && requestId) {
+          const row = await store.mcpTeamRequest(membership.orgId, sessionId, membership.uid, requestId);
+          if (!row) return send(response, 404, { error: "no such request" });
+          if (row.status === "revoked") return send(response, 410, { error: "this request was revoked" });
+          if (row.status === "pending") {
+            if (row.expiresAt <= Date.now()) return send(response, 410, { error: "this request expired" });
+            return send(response, 202, { status: "pending", expiresAt: row.expiresAt });
+          }
+          /*
+           * The credential leaves the service exactly once. A lost fetch is
+           * recovered by asking again, which costs the owner one more
+           * observe-only grant at most.
+           */
+          if (row.bearer === undefined) return send(response, 410, { error: "this request was already delivered" });
+          return send(response, 200, {
+            status: "issued",
+            grantId: row.grantId,
+            expiresAt: row.grantExpiresAt,
+            sealedToRecipient: row.sealedToRecipient,
+            bearer: row.bearer,
+          });
+        }
+        return send(response, 405, { error: "method not allowed" });
+      }
+
+      const teamHostRoute = url.pathname.match(/^\/api\/cli\/sessions\/([A-Za-z0-9_-]{6,64})\/mcp\/team-requests(\/([A-Za-z0-9_-]{6,64})\/(grant|revoke-ack))?$/);
+      if (teamHostRoute) {
+        const sessionId = teamHostRoute[1];
+        const requestId = teamHostRoute[3];
+        const action = teamHostRoute[4];
+        const token = await requireCli(request);
+        if (!token) return send(response, 401, { error: "not signed in" });
+        const membership = await store.membershipOf(token.uid);
+        if (!membership) return send(response, 404, { error: "no such session" });
+        const session = await store.sessionInOrg(membership.orgId, sessionId);
+        if (!session || !ownsSession(membership, session)) return send(response, 404, { error: "no such session" });
+        /*
+         * The session's own machine, from the device it was published by:
+         * the owner's other machines, and every teammate, cannot answer
+         * requests or report grants for a session.
+         */
+        const deviceOk = sessionSource(session).deviceId === token.id;
+        if (request.method === "GET" && !requestId) {
+          if (!deviceOk) return send(response, 403, { error: "only the session's own machine can do this" });
+          const work = await store.listMcpTeamRequests(membership.orgId, sessionId, membership.uid, token.id);
+          if (!work) return send(response, 404, { error: "no such session" });
+          return send(response, 200, work);
+        }
+        if (request.method === "POST" && requestId && action === "grant") {
+          if (!deviceOk) return send(response, 403, { error: "only the session's own machine can do this" });
+          const report = readTeamGrantReport(await readBody(request));
+          if (!report) return send(response, 400, { error: "invalid team grant report" });
+          const result = await store.reportMcpTeamGrant(membership.orgId, sessionId, membership.uid, token.id, requestId, report);
+          const status = { stored: 200, missing: 404, expired: 410, revoked: 409 }[result];
+          return send(response, status, { result });
+        }
+        if (request.method === "POST" && requestId && action === "revoke-ack") {
+          if (!deviceOk) return send(response, 403, { error: "only the session's own machine can do this" });
+          const acked = await store.ackMcpTeamRevocation(membership.orgId, sessionId, membership.uid, token.id, requestId);
+          return send(response, acked ? 200 : 404, acked ? { acked: true } : { error: "no such revocation" });
+        }
+        return send(response, 405, { error: "method not allowed" });
       }
 
       const cliContentRoute = url.pathname.match(/^\/api\/cli\/sessions\/([A-Za-z0-9_-]{6,64})\/(content-policy|content)$/);
@@ -1985,6 +2193,27 @@ export function createApp(options: AppOptions) {
           now,
           await store.appEvents(dayStart(rangeStart(range, now))),
         ));
+      }
+
+      /*
+       * The live use-time check a team MCP grant is re-authorized against.
+       * The DO asks, on every request from a team grant, whether the
+       * requester is still a member and the session still consents; the
+       * answer is this store's current state, nothing cached. The DO fails
+       * closed on anything but an explicit yes.
+       */
+      if (route === "GET /api/internal/mcp/team-authorized") {
+        const expected = options.mcpTeamCheckToken;
+        if (!expected) return send(response, 404, { error: "not found" });
+        const presented = bearer(request);
+        const matches = presented.length === expected.length &&
+          timingSafeEqual(Buffer.from(presented), Buffer.from(expected));
+        if (!matches) return send(response, 401, { error: "unauthorized" });
+        const sessionId = url.searchParams.get("session");
+        const requester = url.searchParams.get("requester");
+        const grantId = url.searchParams.get("grant");
+        if (!sessionId || !requester || !grantId) return send(response, 400, { error: "missing parameters" });
+        return send(response, 200, { authorized: await store.teamAuthorization(sessionId, requester, grantId) });
       }
 
       /* ---- Inbox ---- */
