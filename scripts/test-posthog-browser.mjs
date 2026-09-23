@@ -29,12 +29,14 @@ const built=await build({
     import {ProductAnalytics} from './src/components/ProductAnalytics';
     import {trackAppAction} from '../web/posthog';
     window.fixtureUser={uid:'${marker}',email:'${marker}@example.test'};
+    window.fixtureInitializing=location.pathname==='/sessions/loading';
     function Fixture(){const [n,setN]=useState(0); window.renderIdentity=u=>{window.fixtureUser=u;setN(n+1)};
+      window.fixtureReady=()=>{window.fixtureInitializing=false;setN(n+1)};
       return React.createElement(BrowserRouter,null,React.createElement(ProductAnalytics));}
     window.fixtureAction=()=>trackAppAction('/api/sessions/${marker}/automation?password=${marker}','PATCH',true);
     createRoot(document.getElementById('root')).render(React.createElement(StrictMode,null,React.createElement(Fixture)));
   `,resolveDir:join(base,'app'),sourcefile:'posthog-fixture.jsx'},
-  plugins:[{name:'auth-test-only',setup(b){b.onResolve({filter:/auth\/AuthProvider$/},()=>({path:'test-auth',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export function useAuth(){return {user:window.fixtureUser,initializing:false}}',loader:'js'}));}}],
+  plugins:[{name:'auth-test-only',setup(b){b.onResolve({filter:/auth\/AuthProvider$/},()=>({path:'test-auth',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export function useAuth(){return {user:window.fixtureUser,initializing:window.fixtureInitializing}}',loader:'js'}));}}],
 });
 async function handler({requestId,request}){
   const url=new URL(request.url);
@@ -102,6 +104,16 @@ try{
   await browser.evaluate('renderIdentity(null)');
   await wait(()=>events.some(e=>e.phase===phase&&e.payload.event==='signed_out'),'sign out');
   reports.push('StrictMode + private route + game SPA + mutation + logout');
+  await browser.navigate('about:blank');await delay(150);
+  phase='fixture-loading';await browser.navigate('https://app.shell.online/sessions/loading');
+  await wait(()=>browser.evaluate('typeof window.fixtureReady === "function"'),'auth hydration fixture');
+  await delay(80);
+  assert.equal(events.filter(e=>e.phase===phase&&e.payload.event==='$pageview').length,0,'no transient auth-loading visit');
+  await browser.evaluate('fixtureReady()');
+  await wait(()=>events.some(e=>e.phase===phase&&e.payload.event==='$pageview'),'hydrated view');
+  await browser.evaluate('fixtureReady()');await delay(80);
+  assert.equal(events.filter(e=>e.phase===phase&&e.payload.event==='$pageview').length,1,'auth restore counts once');
+  reports.push('initial login restoration is not a duplicate visit');
   // Literal scripts only: no input or serialized strings interpolated into code.
   for (const [label, source] of [
     ['safari-ua', "Object.defineProperty(navigator,'userAgent',{get:()=> 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1'});"],
@@ -135,7 +147,10 @@ try{
   reports.push('GPC blocks browser capture');
   for(const e of events){assert(!JSON.stringify(e).includes(marker));assert(!e.headers.Referer&&!e.headers.Cookie);assert.equal(e.payload.properties.$process_person_profile,false);
     assert.equal(e.payload.properties.capture_source,'browser');
-    assert.equal(e.payload.properties.instrumentation_version,2);
+    assert.equal(e.payload.properties.instrumentation_version,3);
+    assert.match(e.payload.properties.$session_id,/^[a-f0-9]{8}-[a-f0-9]{4}-7[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+    const sessionStart=Number.parseInt(e.payload.properties.$session_id.replaceAll('-','').slice(0,12),16);
+    assert(Date.parse(e.payload.timestamp)>=sessionStart&&Date.parse(e.payload.timestamp)<sessionStart+86400000,'session aggregation timestamp range');
     assert.equal(e.payload.properties.user_agent_status,'present');
     assert.equal(typeof e.payload.properties.browser_automation,'boolean');
     const expected=expectedAgents.get(e.phase)??expectedAgents.get('landing');
