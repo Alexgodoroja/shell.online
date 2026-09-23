@@ -387,3 +387,41 @@ describe("a prompt read back off an agent's own screen", () => {
     expect(texts(transcript)).toEqual(["typed on the laptop"]);
   });
 });
+
+describe("unchanged agent frames", () => {
+  const answer = (runs = [{ text: "result", fg: "#ff0000" }]) => ({
+    kind: "received" as const, text: "", open: true, preformatted: false,
+    lines: [{ text: "result", runs }],
+  });
+
+  it("keeps the revision stable for equal content with new object identities", () => {
+    const transcript = new Transcript();
+    transcript.fromAgent(answer(), 1000);
+    const revision = transcript.revision;
+    const message = transcript.messages[0];
+    transcript.fromAgent(answer(), 1010);
+    expect(transcript.revision).toBe(revision);
+    expect(transcript.messages[0]).toBe(message);
+  });
+
+  it.each([
+    { fg: "#00ff00" }, { bg: "#000000" }, { bold: true }, { dim: true },
+    { italic: true }, { underline: true },
+  ])("publishes a style-only update: %j", (style) => {
+    const transcript = new Transcript();
+    transcript.fromAgent(answer(), 1000);
+    const revision = transcript.revision;
+    const runs = [{ text: "result", fg: "#ff0000", ...style }];
+    transcript.fromAgent(answer(runs), 1010);
+    expect(transcript.messages[0].lines[0].runs).toEqual(runs);
+    expect(transcript.revision).toBeGreaterThan(revision);
+  });
+
+  it("publishes changed run boundaries even when the plain text is unchanged", () => {
+    const transcript = new Transcript();
+    transcript.fromAgent(answer(), 1000);
+    const runs = [{ text: "re", fg: "#ff0000" }, { text: "sult", fg: "#00ff00" }];
+    transcript.fromAgent(answer(runs), 1010);
+    expect(transcript.messages[0].lines[0].runs).toEqual(runs);
+  });
+});

@@ -646,7 +646,16 @@ function echoMatches(line: string, command: string): boolean {
 function differs(had: readonly TranscriptLine[], next: readonly TranscriptLine[]): boolean {
   if (had.length !== next.length) return true;
   for (let index = 0; index < had.length; index += 1) {
-    if (had[index].text !== next[index].text) return true;
+    const previous = had[index];
+    const current = next[index];
+    if (previous.text !== current.text || previous.runs.length !== current.runs.length) return true;
+    for (let run = 0; run < previous.runs.length; run += 1) {
+      const a = previous.runs[run];
+      const b = current.runs[run];
+      if (a.text !== b.text || a.fg !== b.fg || a.bg !== b.bg ||
+          a.bold !== b.bold || a.dim !== b.dim || a.italic !== b.italic ||
+          a.underline !== b.underline) return true;
+    }
   }
   return false;
 }
