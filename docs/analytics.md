@@ -45,7 +45,7 @@ connect a phone ad click to a later installation on another computer.
 - The first-party event endpoint accepts bounded bodies and fixed event/target/
   source values. It does not store submitted page URLs, terminal content, link
   passwords, frame keys or bearer tokens.
-- GPC, DNT, an existing analytics decline and Google's disable flag suppress
+- GPC, DNT, an existing analytics decline, `shell_analytics_opt_out=1` and Google's disable flag suppress
   browser marketing events. GPC/DNT also suppress first-party visitor hashing.
   Aggregate operational request counts are separate and can still be recorded.
 - Public event reports and installer reports can be spoofed; rate limits and
@@ -64,6 +64,62 @@ Before deploying analytics changes, inspect actual Google collection requests
 with collection intercepted rather than sent. Verify one page view, correct
 source/medium, copy and CTA events, and no private URL fields. Mocked `dataLayer`
 tests alone do not prove what Google's script transmits.
+
+## X advertising pixel
+
+The public pixel ID is `rfilf`. Only the eligible public landing page
+initializes it, once per document. Documentation, account, vault, terminal, stats, local-preview,
+unknown-query and private-fragment pages do not. GPC, DNT and saved analytics
+opt-outs suppress initialization. A missing/blocked vendor script must not stop
+the page from working.
+
+Before `twq('config', 'rfilf')`, the integration sets `page_location` to the fixed
+public URL `https://shell.online/` (also replacing any original referrer)
+and disables automatic button capture, advanced matching, data-layer tracking
+and dwell/page-leave tracking. The real vendor-script browser gate verifies
+these switches: they are not a guarantee about future vendor script changes.
+X receives its own advertising click/cookie identifiers and normal browser/
+network metadata. Unlike our finite source buckets, it can receive a valid
+`twclid`; its cookies may be shared across shell.online subdomains. We do not
+provide emails, phones, account identifiers or terminal information.
+
+This is **base-visit measurement**, not a claimed install/signup conversion.
+Copying a command, downloading an installer, reporting installation success and
+starting a session are different actions. Set up corresponding real events in
+X Events Manager before wiring event-specific `tw-rfilf-…` IDs. No placeholder
+event is sent, and there is no second `track PageView` on top of `config`.
+Only the fixed landing URL is sent; no query strings or fragments. X's
+auto-created Landing Page Views and Site Visits use the base pixel; no extra
+conversion event ID or Conversion API token is needed for this scope.
+
+The Conversion API is not enabled. Its token is a server secret, never a browser
+variable, checked-in config, CLI argument, log field or public pixel setting.
+Rotate any token exposed in chat. A future server integration requires an actual
+event ID, a verified action, an intentionally collected matching identifier,
+bounded retries and the same `conversion_id` on browser/server copies of one
+action. Do not invent identifiers, send synthetic live conversions, or bypass
+browser opt-outs through the server.
+
+### Pixel verification
+
+| Destination | Scope | What the gate checks |
+| --- | --- | --- |
+| GA4 `G-101HMD03VD` | Public landing/docs | One page view; canonical URL/referrer; copy and CTA separate from installs |
+| X `rfilf` | Public landing only | One base event per collector; URL/form redaction; no automatic events; private-page and opt-out exclusions |
+| PostHog US | Explicit public/app/viewer events | Real browser metadata; route templates; no replay/content; anonymous identity lifecycle |
+| First-party statistics | Public actions and operational milestones | Fixed event/target/source; loads, copies, downloads and reported installs kept separate |
+
+Run `node scripts/test-x-pixel-browser.mjs` and
+`node scripts/test-posthog-browser.mjs` after building the site/app. Set
+`X_PIXEL_LIVE=1` / `POSTHOG_LIVE=1` to exercise deployed assets. Collection is
+intercepted in these gates: passing proves browser behavior, not ingestion into
+an advertiser account. Verify received activity separately in X Events Manager,
+GA4 Realtime and PostHog Live Events using one deliberate operator visit.
+Ad blockers can suppress these services; do not proxy around them or label
+missing events as confirmed bounces.
+
+Vendor references: [X website tracking](https://business.x.com/en/help/campaign-measurement-and-analytics/conversion-tracking-for-websites)
+and [page-location controls](https://business.x.com/en/help/campaign-measurement-and-analytics/conversion-tracking-for-websites/about-conversion-tracking).
 
 ## Platform product analytics (PostHog)
 
@@ -91,12 +147,41 @@ Use `surface` to separate landing, docs, terminal, app and game usage. A copy is
 not an installation, an accepted send is not an agent completing work, and a
 page load is not a verified human visit. Do not equate these stages in funnels.
 
+### Browser and automation filters
+
+Instrumentation version `2` includes `capture_source=browser` or `server` on
+every event. Browser events supply PostHog's `$user_agent` from the browser,
+limited to 1,024 printable ASCII characters. No replacement browser string is
+invented. `user_agent_status` is `present`, `missing` or `invalid`;
+`browser_automation` reflects `navigator.webdriver` when available. A false
+automation flag or a normal-looking user agent does not prove a human visit.
+Server milestones do not copy incoming request headers or impersonate browsers.
+
+For a report of likely non-automated browser traffic, filter to:
+
+- `instrumentation_version = 2`
+- `capture_source = browser`
+- `user_agent_status = present`
+- `browser_automation = false`
+- PostHog's **Is bot = false**
+
+Keep separate views for known automation and unknown/missing metadata. Earlier
+events omitted both user-agent properties, so PostHog may classify real visits
+as `no_user_agent`. Do not delete or relabel that history as confirmed bots, and
+do not apply the new filter to historical conversion comparisons without
+accounting for the instrumentation change. Missing event metadata does not
+establish that the original HTTP request lacked a User-Agent header.
+
+Classification is best-effort, not an access-control rule. No firewall blocks,
+challenges, user IP collection or fingerprinting are introduced by this fix.
+
 ## Privacy and operation
 
 No autocapture, remote JavaScript, replay, DOM text, raw errors, commands,
 terminal output, URLs with identifiers, queries/fragments, referrers, names,
 email addresses, IP forwarding or person profiles. Properties are constructed
-from finite lists rather than redacted after collection. PostHog geo enrichment
+from finite lists, except the bounded browser user-agent string, rather than
+redacted after collection. PostHog geo enrichment
 is disabled. Network requests necessarily reach its US ingestion service.
 
 Anonymous identifiers use a Secure, SameSite=Lax, host-only session cookie, not
@@ -110,3 +195,10 @@ For verification, intercept `/i/v0/e/` in browser tests and assert emitted paylo
 contain no synthetic secret markers. Keep synthetic tests out of production
 analytics. API acceptance proves ingestion accepted a request, not that a report
 has finished processing it. A capture token cannot query dashboards.
+
+Run `node scripts/test-posthog-browser.mjs` after building the site and app to
+check actual outgoing requests, metadata, route templates, actions, SPA
+navigation, duplicate prevention and privacy controls. Set `POSTHOG_LIVE=1`
+to inspect deployed assets; collection remains intercepted so synthetic events
+never enter the project. Safari/X-browser user-agent fixtures are emulated in
+Chrome, not a claim of running those browsers themselves.
