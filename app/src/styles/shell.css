@@ -453,14 +453,19 @@
  * in, and it is why the conversation and the terminal both stopped short of
  * the rail rather than starting where it ends. The tab line above keeps the
  * gutter, because that is a row of controls and does want one.
+ *
+ * A pane that is *showing*, not merely one that exists. Open tabs stay
+ * mounted while the list is in front of them -- that is what makes switching
+ * back instant -- so `:has(.panes)` is true on the sessions list too, and the
+ * list lost the margins every other page in the application has.
  */
-.shell-content:has(.panes) {
+.shell-content:has(.panes:not([hidden])) {
   padding-inline: 0;
 }
 
-.shell-content:has(.panes) > .terminal-bar,
-.shell-content:has(.panes) > .renderer-warning,
-.shell-content:has(.panes) > .session-panel-summary {
+.shell-content:has(.panes:not([hidden])) > .terminal-bar,
+.shell-content:has(.panes:not([hidden])) > .renderer-warning,
+.shell-content:has(.panes:not([hidden])) > .session-panel-summary {
   padding-inline: clamp(22px, 2.4vw, 34px);
 }
 
@@ -620,6 +625,17 @@
      just like the phone, without an outer scroller or unused footer gutter. */
   :root[data-pane="open"] .shell {
     height: var(--visible-height, calc(100dvh / var(--zoom)));
+  }
+
+  /*
+   * And it sits where the window is, not where the document starts. See
+   * `--viewport-top` in lib/app-height.ts: a browser that scrolls the visual
+   * viewport to lift a field above the keyboard leaves the shell hanging off
+   * the top of the screen by exactly this much.
+   */
+  .shell {
+    position: relative;
+    top: var(--viewport-top, 0px);
   }
 
   :root[data-pane="open"] .shell-content {
