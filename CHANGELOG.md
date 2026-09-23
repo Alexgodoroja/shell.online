@@ -2,6 +2,27 @@
 
 All notable user-visible changes are recorded here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- Tablet navigation no longer consumes the app's terminal workspace. Short
+  landscape windows keep terminal rows and overflow tabs reachable.
+- Shared-session headers keep Controls, Report, connection state and the MCP
+  encryption disclosure visible across phone, tablet and desktop widths.
+- Added Chrome CI and Safari-compatible responsive browser checks using real
+  terminal rendering and an isolated Go host/relay.
+- Light, dark, and system appearance are selectable under Account. Shared links
+  use the same warm surfaces, readable controls and dialog styling as the app;
+  terminal ANSI colors are preserved.
+- Long team email addresses, comment actions and audit filters stay inside narrow
+  layouts. Compact landscape navigation leaves more room for the terminal.
+- Dark-mode menus and mobile sheets no longer cast pale shadows or white scrims.
+  Terminal pixel, cursor-position, scrollback and TUI mouse checks now run in CI.
+- Long names, agent badges, session statuses and comment authors now wrap or
+  ellipsize without pushing actions offscreen. Browser checks stress long labels
+  in both themes and reject clipped permission/status text or overlapping controls.
+
 ## [0.23.0] — 2026-09-23
 
 ### Added
