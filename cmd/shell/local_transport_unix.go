@@ -21,28 +21,26 @@ func listenLocalControl(id string) (net.Listener, error) {
 	if err == nil {
 		return secureLocalControlSocket(path, listener)
 	}
-
-	// A socket left by an interrupted process is safe to replace, but never
-	// unlink a live process's control channel. A concurrent second launch will
-	// either connect here or lose the retrying bind below without clobbering it.
-	if connection, dialError := net.DialTimeout("unix", path, 150*time.Millisecond); dialError == nil {
-		_ = connection.Close()
-		return nil, fmt.Errorf("local control channel is already active")
-	}
-	if removeError := os.Remove(path); removeError != nil && !os.IsNotExist(removeError) {
-		return nil, removeError
-	}
-	listener, err = net.Listen("unix", path)
-	if err != nil {
-		return nil, err
-	}
-	return secureLocalControlSocket(path, listener)
+	// A denied/timed-out dial cannot distinguish a stale socket from a live
+	// listener. Even ECONNREFUSED is only a snapshot: another host can bind
+	// before an unlink. Startup never removes an existing control path.
+	return nil, fmt.Errorf("local control channel is already active or unavailable; refusing automatic removal: %w", err)
 }
 
 func secureLocalControlSocket(path string, listener net.Listener) (net.Listener, error) {
+	// net.UnixListener's default close unlinks by name, even if that name has
+	// since been rebound. Disable it so ownership cleanup is inode-checked.
+	if unix, ok := listener.(*net.UnixListener); ok {
+		unix.SetUnlinkOnClose(false)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = listener.Close()
-		_ = os.Remove(path)
+		removeOwnedLocalFile(path, info)
 		return nil, err
 	}
 	return listener, nil
@@ -71,18 +69,38 @@ func ensureLocalSessionDirectory() (string, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", err
 	}
-	info, err := os.Stat(directory)
+	info, err := os.Lstat(directory)
 	if err != nil {
 		return "", err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != os.Getuid() {
+	if !info.IsDir() || !ok || int(stat.Uid) != os.Getuid() {
 		return "", fmt.Errorf("local session directory is not owned by the current user")
 	}
 	if info.Mode().Perm() != 0o700 {
 		if err := os.Chmod(directory, 0o700); err != nil {
 			return "", err
 		}
+	}
+	return directory, nil
+}
+
+// existingLocalSessionDirectory reports the runtime directory only when it is a
+// private directory owned by the current user. Discovery must not create it:
+// a missing directory means there is nothing to observe, and a directory that
+// is not ours is not ours to rewrite.
+func existingLocalSessionDirectory() (string, error) {
+	directory, err := localSessionDirectory()
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.IsDir() || !ok || int(stat.Uid) != os.Getuid() || info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("local session directory is not private to the current user")
 	}
 	return directory, nil
 }
@@ -103,4 +121,28 @@ func localSessionDirectory() (string, error) {
 
 func localSessionSocketPath(directory, id string) string {
 	return filepath.Join(directory, id+".sock")
+}
+
+// localControlSocketInfo reports the bound control socket's path and inode so a
+// cleanup can remove it only when it is still the exact file that was created.
+func localControlSocketInfo(directory, id string) (string, os.FileInfo) {
+	path := localSessionSocketPath(directory, id)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", nil
+	}
+	return path, info
+}
+
+// localSocketOwnershipHolds reports whether the socket at path is still the
+// one we bound. A same-name replacement (a later launch) is not ours.
+func localSocketOwnershipHolds(path string, info os.FileInfo) bool {
+	if info == nil || path == "" {
+		return false
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(current, info)
 }

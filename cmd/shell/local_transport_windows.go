@@ -18,6 +18,15 @@ func localPipePath(id string) string {
 	return `\\.\pipe\shell-online-` + id
 }
 
+// localControlSocketInfo reports the control channel's path and inode. Named
+// pipes are removed when the listener closes, so there is no file to track.
+func localControlSocketInfo(directory, id string) (string, os.FileInfo) { return "", nil }
+
+// localSocketOwnershipHolds: on Windows the bound named pipe's exclusivity is
+// the authority (a same-name replacement cannot bind while we hold it), so no
+// filesystem check is needed.
+func localSocketOwnershipHolds(path string, info os.FileInfo) bool { return true }
+
 func listenLocalControl(id string) (net.Listener, error) {
 	token, err := windows.OpenCurrentProcessToken()
 	if err != nil {
@@ -51,6 +60,24 @@ func ensureLocalSessionDirectory() (string, error) {
 	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", err
+	}
+	return directory, nil
+}
+
+// existingLocalSessionDirectory reports the runtime directory only when it is a
+// regular directory. Discovery must not create it, and a symlink is not a
+// directory it is safe to rewrite.
+func existingLocalSessionDirectory() (string, error) {
+	directory, err := localSessionDirectory()
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("local session directory is not a regular directory")
 	}
 	return directory, nil
 }
