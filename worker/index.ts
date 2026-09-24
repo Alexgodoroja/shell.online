@@ -47,7 +47,12 @@ import {
   MAX_SESSION_VIEWERS,
   viewerAdmission,
 } from "../shared/session-capacity";
-import { terminalGridForDevices } from "../shared/terminal-grid";
+import {
+  MOBILE_TERMINAL_GRID,
+  WIDE_DESKTOP_TERMINAL_GRID,
+  advertisesGrid,
+  terminalGridForDevices,
+} from "../shared/terminal-grid";
 import { persistentSessionID } from "../shared/persistent-session";
 import {
   disconnectedSessionExpiry,
@@ -262,6 +267,10 @@ interface SocketAttachment {
   /** Set once a viewer has been refused input, so the refusal is counted once per viewer. */
   inputDeniedAt?: number;
   supportsPortraitGrid?: boolean;
+  /** Whether the host's CLI will open the wider desktop grid; see terminal-grid.ts. */
+  supportsWideGrid?: boolean;
+  /** Whether this viewer's window can draw the wider grid; see wide-grid.ts. */
+  wide?: boolean;
 }
 
 interface TrafficWindow {
@@ -1721,10 +1730,27 @@ export class TerminalSession extends DurableObject<Env> {
         const attachment = readAttachment(socket);
         return attachment?.portrait ? "portrait" : attachment?.device ?? "unknown";
       });
-    const supportsPortraitGrid = this.state.getWebSockets("host")
-      .some((socket) => socket.readyState === 1 && readAttachment(socket)?.supportsPortraitGrid === true);
-    const grid = terminalGridForDevices(devices, supportsPortraitGrid);
+    const hosts = this.state.getWebSockets("host").filter((socket) => socket.readyState === 1);
+    const supportsPortraitGrid = hosts.some((socket) => readAttachment(socket)?.supportsPortraitGrid === true);
+    const grid = terminalGridForDevices(devices, supportsPortraitGrid, this.everyViewerDrawsWide());
     return { cols: grid.cols, rows: grid.rows };
+  }
+
+  /**
+   * Whether the wider desktop grid may be used at all right now.
+   *
+   * The host has to be able to open it, and every viewer watching has to be
+   * able to draw it. Not "some viewer": the grid is the session's, so one
+   * window too small to land 160 columns on pixels is a session nobody in it
+   * can read, and the smallest viewer therefore decides. A viewer that claims
+   * nothing is counted as unable, which is what keeps every other client and
+   * every older app on the size they have today.
+   */
+  private everyViewerDrawsWide(): boolean {
+    const hosts = this.state.getWebSockets("host").filter((socket) => socket.readyState === 1);
+    if (!hosts.some((socket) => readAttachment(socket)?.supportsWideGrid === true)) return false;
+    const viewers = this.state.getWebSockets("viewer").filter((socket) => socket.readyState === 1);
+    return viewers.length > 0 && viewers.every((socket) => readAttachment(socket)?.wide === true);
   }
 
   // Keep the allocated model's grid in sync with the negotiated viewer grid (a viewer connecting
@@ -3045,7 +3071,12 @@ export class TerminalSession extends DurableObject<Env> {
       client: analyticsContext.client,
       referrer: analyticsContext.referrer,
       portrait: role === "viewer" && new URL(request.url).searchParams.get("layout") === "portrait",
-      supportsPortraitGrid: role === "host" && request.headers.get("X-Shell-Terminal-Grid") === "80x40",
+      /* A viewer that can draw the wider grid; one that cannot says nothing. */
+      wide: role === "viewer" && new URL(request.url).searchParams.get("layout") === "wide",
+      supportsPortraitGrid:
+        role === "host" && advertisesGrid(request.headers.get("X-Shell-Terminal-Grid"), MOBILE_TERMINAL_GRID),
+      supportsWideGrid:
+        role === "host" && advertisesGrid(request.headers.get("X-Shell-Terminal-Grid"), WIDE_DESKTOP_TERMINAL_GRID),
       connectedAt: Date.now(),
     };
 
@@ -3920,11 +3951,9 @@ export class TerminalSession extends DurableObject<Env> {
         const attachment = readAttachment(socket);
         return attachment?.portrait ? "portrait" : attachment?.device ?? "unknown";
       });
-    const supportsPortraitGrid = this.state
-      .getWebSockets("host")
-      .filter((socket) => socket.readyState === 1)
-      .some((socket) => readAttachment(socket)?.supportsPortraitGrid === true);
-    const grid = terminalGridForDevices(devices, supportsPortraitGrid);
+    const liveHosts = this.state.getWebSockets("host").filter((socket) => socket.readyState === 1);
+    const supportsPortraitGrid = liveHosts.some((socket) => readAttachment(socket)?.supportsPortraitGrid === true);
+    const grid = terminalGridForDevices(devices, supportsPortraitGrid, this.everyViewerDrawsWide());
     const message = JSON.stringify({
       type: "terminal_size",
       ...grid,
