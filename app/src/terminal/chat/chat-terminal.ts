@@ -192,6 +192,10 @@ export class ChatTerminal {
     /* Ctrl-U: drop a half-typed line, so it cannot be submitted after the replay. */
     this.input.push("\x15");
     this.onScreen = false;
+    this.screenDirty = false;
+    this.windowTitle = "";
+    this.semantic = false;
+    this.lastCommand = "";
     this.inner.reset();
     this.view?.setDirect(false);
   }
@@ -367,6 +371,8 @@ export class ChatTerminal {
 
     if (this.onScreen) {
       this.onScreen = false;
+      if (this.agentQuiet) clearTimeout(this.agentQuiet);
+      this.agentQuiet = null;
       if (this.agent) {
         /* Whatever it finished on, before it gave the screen back. */
         for (const utterance of this.agent.flush()) this.transcript.fromAgent(utterance, now);
@@ -454,7 +460,7 @@ export class ChatTerminal {
       if (!this.agent) return;
       const now = Date.now();
       let changed = false;
-      for (const utterance of this.agent.flush()) {
+      for (const utterance of this.agent.settle()) {
         this.transcript.fromAgent(utterance, now);
         changed = true;
       }
