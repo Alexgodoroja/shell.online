@@ -13,7 +13,6 @@
  * changes nothing touches no nodes at all.
  */
 
-import { bytesForKey } from "./keys";
 import type { Message, StyleRun, TranscriptLine } from "./transcript";
 
 export interface ChatViewOptions {
@@ -29,21 +28,6 @@ export interface ChatViewOptions {
  */
 const COMPOSING = 229;
 
-/**
- * Whether this is being read with a finger.
- *
- * It decides one thing, and it is the difference between a usable session and
- * an unusable one: whether a full-screen program gets the keys as they are
- * pressed, or gets a line when it is finished. See `composes`.
- *
- * Both tests, for the reason the stylesheet uses both: `pointer` is not
- * always reported honestly, and a phone-width window is a phone often enough
- * to be worth catching.
- */
-function touchScreen(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  return window.matchMedia("(pointer: coarse)").matches || window.matchMedia("(max-width: 760px)").matches;
-}
 
 /** Rows a finished answer shows before it is folded. */
 const COLLAPSE_AFTER = 40;
@@ -104,8 +88,6 @@ export class ChatView {
    * beforeinput below lets that one through instead of sending. See onInsert.
    */
   private breaking = false;
-  /** Decided once: a pointer does not become a finger while a session is open. */
-  private readonly touch = touchScreen();
   private disposed = false;
   private readonly resizes: ResizeObserver | null;
 
@@ -395,13 +377,7 @@ export class ChatView {
     this.input.disabled = reason !== null;
     this.send.disabled = reason !== null;
     this.composer.dataset.disabled = reason === null ? "false" : "true";
-    this.input.placeholder =
-      reason ??
-      (this.composes()
-        ? this.direct
-          ? "Message the program"
-          : "Run a command"
-        : "Keys go straight to the program");
+    this.input.placeholder = reason ?? (this.direct ? "Message the program" : "Run a command");
   }
 
   /**
@@ -417,32 +393,29 @@ export class ChatView {
     this.direct = on;
     this.root.dataset.direct = on ? "true" : "false";
     /*
-     * Only where the box is about to stop being a box. Where it still
-     * composes, a program taking the screen is no reason to throw away the
-     * line somebody is halfway through typing into it.
+     * The line somebody is halfway through typing survives: a program taking
+     * the screen is no reason to throw away what they were writing to it.
      */
-    if (!this.composes()) this.input.value = "";
     this.autosize();
     this.setDisabled(this.disabled);
   }
 
-  /**
-   * Whether the box composes a line, or forwards each key as it is pressed.
+  /*
+   * There is no forwarding mode any more, so there is no question to ask.
    *
-   * A full-screen program reads keys, so forwarding them is right -- on a
-   * keyboard. On a phone it was the single worst thing in this renderer: the
-   * box stayed empty while what you typed was painted into the program's own
-   * input box, which is somewhere inside an eighty-column grid that does not
-   * fit the screen. You typed a prompt to an agent and could not see it.
+   * The box used to forward each key straight to the program whenever a
+   * program owned the screen, which is every agent session. That was right
+   * while the grid those keys landed in was mirrored into the thread: you
+   * could watch them arrive. The mirror is gone -- a grid does not go on a
+   * phone, and a program that cannot be read as messages now gets a line
+   * saying so -- and a forwarded key went somewhere nothing displays. On a
+   * phone that had already been fixed by composing; on a laptop it meant
+   * typing a prompt to an agent and watching an empty box.
    *
-   * So a touch screen composes even in direct mode. What it gives up is the
-   * arrow keys, which a phone keyboard does not have, and the control keys,
-   * which are the chips above the box and were already the only way to reach
-   * them here.
+   * What composing gives up is keys as keys: the arrows, and the control
+   * keys, which are the chips above the box and were already the only way to
+   * reach them here. Ctrl-C still interrupts, from the keydown rule below.
    */
-  private composes(): boolean {
-    return !this.direct || this.touch;
-  }
 
   focus(): void {
     this.input.focus();
@@ -764,17 +737,6 @@ export class ChatView {
     }
     event.preventDefault();
     if (this.disabled) return;
-    /*
-     * Direct mode is a program reading keys, so Return is a byte rather than
-     * a line. The keydown rule normally turns it into one and cancels this
-     * event before it ever fires; on the keyboards that do not say which key
-     * was pressed it does not, and this is the same key arriving by the only
-     * route left.
-     */
-    if (!this.composes()) {
-      this.options.onKeys("\r");
-      return;
-    }
     this.submit();
   };
 
@@ -822,19 +784,6 @@ export class ChatView {
 
   private readonly onKeyDown = (event: KeyboardEvent): void => {
     if (this.disabled) return;
-
-    if (!this.composes()) {
-      /*
-       * Every key belongs to the program, except the ones that belong to the
-       * browser. bytesForKey returns null for those, and the default action
-       * then happens as it would on any page.
-       */
-      const bytes = bytesForKey(event);
-      if (bytes === null) return;
-      event.preventDefault();
-      this.options.onKeys(bytes);
-      return;
-    }
 
     /*
      * A phone keyboard predicting a word, and every language that composes
