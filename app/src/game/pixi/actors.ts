@@ -5,6 +5,7 @@ import { makeUnmade, walkUnmade, type Unmade } from "./unmade";
 import { depthOf, TILE_H, toScreen } from "../world/iso";
 import type { Loaded } from "./scene";
 import type { Actor, Sim } from "../world/sim";
+import { ACTOR_SCALE } from "../world/scale";
 
 /**
  * The people on the map, and the things that got in.
@@ -18,7 +19,7 @@ import type { Actor, Sim } from "../world/sim";
 import { UNIT_FOR } from "./units";
 
 /** How much bigger than drawn a soldier is. See `make`. */
-const FIGURE = 1.85;
+const FIGURE = 1.85 * ACTOR_SCALE;
 
 /**
  * And how much bigger the Unmade are drawn than they are built.
@@ -33,7 +34,7 @@ const FIGURE = 1.85;
  * for a courtyard and useless here. The three builds keep their proportions to
  * each other, so a mite is still a mite next to a heisenbug.
  */
-const UNMADE = 1.9;
+const UNMADE = 1.9 * ACTOR_SCALE;
 
 /**
  * How much bigger again a hero is.
@@ -48,7 +49,7 @@ const UNMADE = 1.9;
  * a hundred and twenty-eight tiles across, and a figure sized for a courtyard
  * is a speck on it.
  */
-const HERO = 3.1;
+const HERO = 3.1 * ACTOR_SCALE;
 
 /** A small deterministic offset, so two bugs do not step in lockstep. */
 function hashOf(id: string): number {
@@ -200,7 +201,7 @@ export class ActorLayer {
 
     const shadow = new Graphics();
     shadow
-      .ellipse(0, 0, (16 * size) / FIGURE, (7 * size) / FIGURE)
+      .ellipse(0, 0, (16 * size * ACTOR_SCALE) / FIGURE, (7 * size * ACTOR_SCALE) / FIGURE)
       .fill({ color: 0x1a1008, alpha: 0.32 });
     root.addChild(shadow);
 
@@ -209,8 +210,11 @@ export class ActorLayer {
       bug.root.scale.set(UNMADE);
       bug.root.position.set(0, TILE_H * 0.25);
       root.addChild(bug.root);
-      /* The shadow grows with what casts it, or the creature floats. */
-      shadow.scale.set(UNMADE);
+      /*
+       * The shadow grows with what casts it, or the creature floats. Less the
+       * field's own enlargement, which the ellipse above already carries.
+       */
+      shadow.scale.set(UNMADE / ACTOR_SCALE);
 
       /* Health over the creature, shown only once something is off it. */
       const hurt = new Graphics();
@@ -398,8 +402,8 @@ export class ActorLayer {
        * better than a static figure with a number popping off it.
        */
       const lunging = actor.action === "attack";
-      piece.figure.position.x = lunging ? actor.facing * 5 : 0;
-      piece.figure.position.y = TILE_H * 0.25 + (actor.moving ? Math.sin(sim.clock / 3) * 1.5 : 0);
+      piece.figure.position.x = lunging ? actor.facing * 5 * ACTOR_SCALE : 0;
+      piece.figure.position.y = TILE_H * 0.25 + (actor.moving ? Math.sin(sim.clock / 3) * 1.5 * ACTOR_SCALE : 0);
 
       /* Six legs, walking in alternating tripods, which is how insects walk. */
       if (piece.bug) walkUnmade(piece.bug, sim.clock / 2.6 + hashOf(actor.id), actor.moving);
