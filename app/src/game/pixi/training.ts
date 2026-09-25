@@ -2,7 +2,7 @@ import { Container, FillGradient, Graphics, Sprite, Text, type Texture } from "p
 import { depthOf, toScreen } from "../world/iso";
 import { MAP } from "../world/marches";
 import type { Sim } from "../world/sim";
-import { BODY_FONT } from "./fonts";
+import { BODY_FONT, bodyText } from "./fonts";
 
 /**
  * A soldier being trained at the Forge, drawn so it can be seen from anywhere.
@@ -219,7 +219,7 @@ export class TrainingFx {
     ring.tint = 0xffd27a;
 
     const label = new Text({
-      text: name ? `${name} joins` : "",
+      text: name ? bodyText(`${name} joins`) : "",
       resolution: 2,
       style: {
         fontFamily: BODY_FONT,

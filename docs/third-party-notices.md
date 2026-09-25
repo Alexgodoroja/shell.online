@@ -89,20 +89,9 @@ Copyright (c) 2012 Rodrigo Fuenzalida and Nicolas Massi, with Reserved Font Name
 "Pirata". Licensed under the SIL Open Font License, Version 1.1; the full text is
 vendored beside the font at `app/public/fonts/OFL-Pirata-One.txt`.
 
-Used by the game skin only, for the names on the holdings' signposts, and
-declared inside the game's own stylesheet so it travels in the lazy chunk rather
+Used by the game skin only, for all of its text -- titles in capitals, body text
+in lowercase -- and declared inside the game's own stylesheet so it travels in the lazy chunk rather
 than in the bundle everybody downloads.
-
-## Kingjola — licence to be confirmed
-
-Typeface (c) Lars Manenschijn, 2009. The file's own metadata reads "All Rights
-Reserved" and carries no licence text, so the terms under which it may be
-redistributed have to be confirmed with the author before this ships. Vendored at
-`app/public/fonts/kingjola.ttf`.
-
-Used by the game skin only, for the lowercase letters of body text; capitals,
-digits and punctuation fall through to Pirata One. Declared inside the game's own
-stylesheet, so it travels in the lazy chunk.
 
 ## PixiJS — MIT
 

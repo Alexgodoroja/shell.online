@@ -10,7 +10,7 @@ import { buildScatter } from "./scatter";
 import { buildRoadside, type Lanterns } from "./roadside";
 import { headroom, openingZoom, zoomBounds } from "../engine/zoom";
 import { builtAt, STRUCTURE_SCALE } from "../world/scale";
-import { BODY_FONT } from "./fonts";
+import { BODY_FONT, bodyText } from "./fonts";
 
 /**
  * Everything standing on the ground: buildings, signs, trees, and the people.
@@ -221,7 +221,7 @@ export function signFor(garrison: Garrison): Container {
   name.anchor.set(0.5, 0);
 
   const purpose = new Text({
-    text: garrison.purpose,
+    text: bodyText(garrison.purpose),
     style: {
       fontFamily: BODY_FONT,
       fontSize: 16,

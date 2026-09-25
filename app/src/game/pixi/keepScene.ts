@@ -144,8 +144,6 @@ export async function buildKeepScene(
      * because a font did not is not.
      */
     document.fonts?.load('26px "Pirata One"').catch(() => undefined),
-    /* And the body face, for the plates, the sentences and the numbers. */
-    document.fonts?.load('16px "Kingjola"').catch(() => undefined),
   ]);
   const { root, camps, campBanners, campLights, lanterns, banners, things, labels, signs } =
     buildWorld(app, art, kingdom);

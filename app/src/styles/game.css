@@ -18,35 +18,6 @@
   font-display: swap;
 }
 
-@font-face {
-  /*
-   * The face everything else is set in: panels, sentences, numbers, and the
-   * plates on the canvas (pixi/fonts.ts carries the same stack).
-   *
-   * The monospace stack it replaces was the one thing in the interface that
-   * read as a web page rather than a keep.
-   *
-   * Lowercase only. Kingjola's capitals are swash initials that turn a label
-   * in capitals into a tangle, and its digits and most punctuation are empty
-   * glyphs -- used whole, every number in the HUD vanished. So `unicode-range`
-   * takes a to z from it and lets everything else fall through the stack to
-   * Pirata One, the blackletter the titles are already set in, which has all
-   * of them and reads as the same hand.
-   *
-   * Its x-height is a third of the em, so `size-adjust` enlarges it rather
-   * than every font-size in this file: the sizes stay the honest floor
-   * check-game-ui.mjs enforces, and the letters come out at the height those
-   * sizes promise.
-   */
-  font-family: "Kingjola";
-  src: url("/fonts/kingjola.ttf") format("truetype");
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  unicode-range: U+0061-007A;
-  size-adjust: 170%;
-}
-
 /*
  * Shell Keep — the game skin.
  *
@@ -169,7 +140,12 @@
    * to read across a room, and legibility is the rule this file is held to.
    * The uppercase and the letter-spacing do the period work instead.
    */
-  --keep-font: "Kingjola", "Pirata One", Georgia, serif;
+  /*
+   * One medieval face for everything: Pirata One, the blackletter the titles
+   * and signs were already set in. Body text is set in its lowercase (see the
+   * rule on .keep below); titles and labels keep their capitals.
+   */
+  --keep-font: "Pirata One", Georgia, serif;
 
   position: fixed;
   inset: 0;
@@ -181,8 +157,38 @@
   font-family: var(--keep-font);
   font-size: var(--keep-text);
   line-height: 1.45;
+  /*
+   * Body text in the blackletter's lowercase, which is where it reads as a
+   * hand rather than a headline. Anything set in capitals on purpose -- a
+   * title, a label -- says so with its own text-transform and keeps them.
+   */
+  text-transform: lowercase;
   -webkit-font-smoothing: none;
   font-smooth: never;
+}
+
+/*
+ * What a person typed, and what a machine will run, is shown as it is. A
+ * command lowercased on screen is a different command from the one sent.
+ */
+.keep :is(input, textarea, select, option, code, kbd) {
+  text-transform: none;
+}
+
+/*
+ * Buttons take the lowercase too. The browser's own stylesheet gives them
+ * `text-transform: none`, so a menu's second line stayed in sentence case
+ * beside every other sentence. `:where` keeps this at no specificity, so any
+ * class that sets capitals on purpose still wins.
+ */
+:where(.keep) :where(button) {
+  text-transform: inherit;
+}
+
+/* A crest is an initial, and a key cap names a key: both stay capitals. */
+.keep .keep-crest-letter,
+.keep .keep-key {
+  text-transform: uppercase;
 }
 
 /*
