@@ -362,15 +362,16 @@ export class ActorLayer {
    * The topmost match wins, which for an isometric map means the one drawn
    * last -- the figure actually on top where they overlap.
    */
-  hit(x: number, y: number, pickable: (id: string) => boolean): string | undefined {
+  hit(x: number, y: number, pickable: (id: string) => boolean, pad = 0): string | undefined {
     let found: string | undefined;
     let bestDepth = -Infinity;
 
     for (const [id, piece] of this.pieces) {
       if (!pickable(id)) continue;
       const foot = piece.root.y + TILE_H * 0.25;
-      if (x < piece.root.x - piece.halfWidth || x > piece.root.x + piece.halfWidth) continue;
-      if (y > foot + 6 || y < foot - piece.rise) continue;
+      /* `pad` is the slop a fingertip is allowed, in world units. See engine/tap.ts. */
+      if (x < piece.root.x - piece.halfWidth - pad || x > piece.root.x + piece.halfWidth + pad) continue;
+      if (y > foot + 6 + pad || y < foot - piece.rise - pad) continue;
       if (piece.root.zIndex <= bestDepth) continue;
       bestDepth = piece.root.zIndex;
       found = id;

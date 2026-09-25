@@ -379,8 +379,38 @@ export default function GameRoute() {
   useEffect(() => {
     const previous = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    /*
+     * And the page is not allowed to answer a gesture meant for the map.
+     *
+     * `overflow: hidden` on the body does not stop a touch scroll in Safari,
+     * and nothing at all stops Safari's own pinch-to-zoom of the whole page
+     * except refusing its gesture events -- `user-scalable=no` has been
+     * ignored for years. On a phone held sideways the page is taller than the
+     * screen it is shown in, so a drag or a pinch that started anywhere the
+     * canvas did not catch it scrolled or zoomed the page instead, and the map
+     * sat still underneath: "scrolling and zooming are blocked".
+     *
+     * Only inside the keep, and only multi-finger moves: a single finger still
+     * scrolls the lists and panes that are meant to scroll.
+     */
+    const root = document.documentElement;
+    const previousOverscroll = root.style.overscrollBehavior;
+    root.style.overscrollBehavior = "none";
+    const refuse = (event: Event) => event.preventDefault();
+    const pinchInside = (event: TouchEvent) => {
+      if (event.touches.length > 1 && event.target instanceof Element && event.target.closest(".keep")) {
+        event.preventDefault();
+      }
+    };
+    document.addEventListener("gesturestart", refuse, { passive: false });
+    document.addEventListener("gesturechange", refuse, { passive: false });
+    document.addEventListener("touchmove", pinchInside, { passive: false });
     return () => {
       document.body.style.overflow = previous;
+      root.style.overscrollBehavior = previousOverscroll;
+      document.removeEventListener("gesturestart", refuse);
+      document.removeEventListener("gesturechange", refuse);
+      document.removeEventListener("touchmove", pinchInside);
     };
   }, []);
 

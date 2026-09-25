@@ -8,6 +8,7 @@ import { Birds, Blows, Dust, loadEffects, Smoke } from "./ambience";
 import { Banners, OrderMark } from "./banners";
 import { McpFlowLayer } from "./mcp-flows";
 import { TrainingFx } from "./training";
+import { isTap, pickSlop, type Press } from "../engine/tap";
 import type { McpFlow } from "../state/mcp-flows";
 import { loadSigils } from "./sigils";
 import type { Scene } from "./PixiStage";
@@ -300,7 +301,32 @@ export async function buildKeepScene(
    */
   app.stage.eventMode = "static";
   app.stage.hitArea = app.screen;
-  const onTap = (event: { global: { x: number; y: number } }) => {
+
+  /*
+   * Where the current press began, and whether a second finger joined it, so
+   * the end of a pan or a pinch is not mistaken for a tap. See engine/tap.ts.
+   */
+  const down = new Set<number>();
+  let press: Press | undefined;
+  const onDown = (event: { pointerId: number; global: { x: number; y: number } }) => {
+    down.add(event.pointerId);
+    if (down.size === 1) press = { x: event.global.x, y: event.global.y, multi: false };
+    else if (press) press.multi = true;
+  };
+  const onUp = (event: { pointerId: number }) => {
+    down.delete(event.pointerId);
+  };
+  app.stage.on("pointerdown", onDown);
+  app.stage.on("pointerup", onUp);
+  app.stage.on("pointerupoutside", onUp);
+  app.stage.on("pointercancel", onUp);
+
+  const onTap = (event: { global: { x: number; y: number }; pointerType: string }) => {
+    const pressed = press;
+    /* Only once every finger is up, so a pinch's first lift is not a tap either. */
+    if (down.size > 0) return;
+    press = undefined;
+    if (!isTap(pressed, event.global.x, event.global.y, event.pointerType)) return;
     const world = viewport.toWorld(event.global.x, event.global.y);
     const tile = toTile(world.x, world.y);
 
@@ -314,7 +340,12 @@ export async function buildKeepScene(
         .filter((actor) => actor.role === "hero" || actor.role === "soldier")
         .map((actor) => [`${actor.id}`, actor] as const),
     );
-    const hit = actors.hit(world.x, world.y, (id) => inspectable.has(id));
+    const hit = actors.hit(
+      world.x,
+      world.y,
+      (id) => inspectable.has(id),
+      pickSlop(event.pointerType) / viewport.scale.x,
+    );
     const nearest = hit ? inspectable.get(hit) : undefined;
 
     if (nearest) {
@@ -544,6 +575,10 @@ export async function buildKeepScene(
       viewport.off("moved", rescaleSigns);
       app.renderer.off("resize", rescaleSigns);
       app.stage.off("pointertap", onTap);
+      app.stage.off("pointerdown", onDown);
+      app.stage.off("pointerup", onUp);
+      app.stage.off("pointerupoutside", onUp);
+      app.stage.off("pointercancel", onUp);
       companies.destroy();
       orderMark.destroy();
       actors.destroy();

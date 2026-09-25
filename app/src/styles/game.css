@@ -3232,3 +3232,33 @@
 .keep-train-go {
   border-color: var(--keep-brass);
 }
+
+/* ---- touch -------------------------------------------------------------- */
+
+/*
+ * The whole keep is a game surface, not a page.
+ *
+ * The canvas already refuses the browser's own gestures; the HUD over it did
+ * not, so a pan or a pinch that began on a panel, a label or the gap between
+ * two of them scrolled or zoomed the page rather than the map -- and a double
+ * tap on a button zoomed the page in. Nothing here is text to be selected or
+ * held for a callout either. The panes that do scroll say so below.
+ */
+.keep {
+  overscroll-behavior: none;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.keep :is(.keep-yours-list, .keep-pause-panel, .keep-wright, .keep-mcp-flows, .keep-assess, .keep-opening) {
+  touch-action: pan-y;
+}
+
+.keep :is(input, textarea, select) {
+  touch-action: manipulation;
+  -webkit-user-select: text;
+  user-select: text;
+}
