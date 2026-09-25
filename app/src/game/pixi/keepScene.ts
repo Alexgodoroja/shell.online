@@ -21,6 +21,7 @@ import {
   type ZoomBounds,
 } from "../engine/zoom";
 import { createSim, garrisonSoldiers, orderHero, tickSim, yourHero, type Actor, type Mark, type Sim } from "../world/sim";
+import { BODY_FONT } from "./fonts";
 
 /**
  * The Marches, assembled and running.
@@ -89,7 +90,7 @@ function numberFor(text: string, kind: Mark["kind"]): Container {
     /* Rasterised at twice the size, so the enlargement does not blur it. */
     resolution: 2,
     style: {
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontFamily: BODY_FONT,
       fontSize: 44,
       fontWeight: "900",
       fill: kind === "damage" ? 0xff5a4f : 0xffd84a,
@@ -122,6 +123,8 @@ export async function buildKeepScene(
      * because a font did not is not.
      */
     document.fonts?.load('26px "Pirata One"').catch(() => undefined),
+    /* And the body face, for the plates, the sentences and the numbers. */
+    document.fonts?.load('16px "Kingjola"').catch(() => undefined),
   ]);
   const { root, camps, campBanners, campLights, lanterns, banners, things, labels, signs } =
     buildWorld(app, art, kingdom);

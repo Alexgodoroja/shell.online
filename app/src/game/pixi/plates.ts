@@ -1,6 +1,7 @@
 import { Container, Graphics, Text } from "pixi.js";
 import type { Actor } from "../world/sim";
 import { sigilFor, type Sigils } from "./sigils";
+import { BODY_FONT } from "./fonts";
 
 /**
  * What stands above somebody's head.
@@ -45,7 +46,7 @@ export function atWork(actor: Actor, all: Actor[]): number {
   return busy / theirs.length;
 }
 
-const FONT = "ui-monospace, SFMono-Regular, Menlo, monospace";
+const FONT = BODY_FONT;
 
 export interface Plate {
   root: Container;

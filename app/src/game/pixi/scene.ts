@@ -10,6 +10,7 @@ import { buildScatter } from "./scatter";
 import { buildRoadside, type Lanterns } from "./roadside";
 import { headroom, openingZoom, zoomBounds } from "../engine/zoom";
 import { builtAt, STRUCTURE_SCALE } from "../world/scale";
+import { BODY_FONT } from "./fonts";
 
 /**
  * Everything standing on the ground: buildings, signs, trees, and the people.
@@ -203,9 +204,9 @@ export function signFor(garrison: Garrison): Container {
       /*
        * The one place in the game set in blackletter: the name of a place.
        *
-       * Everything else is monospace, because everything else is read in a
+       * Everything else is in the body face, because everything else is read in a
        * hurry and this is not -- you stop walking to read a signpost. The
-       * sentence underneath stays monospace for that reason, so the two are
+       * sentence underneath stays in the body face for that reason, so the two are
        * doing different jobs and look like it.
        */
       fontFamily: '"Pirata One", Georgia, serif',
@@ -222,7 +223,7 @@ export function signFor(garrison: Garrison): Container {
   const purpose = new Text({
     text: garrison.purpose,
     style: {
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      fontFamily: BODY_FONT,
       fontSize: 16,
       fill: 0xc9a06a,
       align: "center",

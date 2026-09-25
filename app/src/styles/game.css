@@ -18,6 +18,35 @@
   font-display: swap;
 }
 
+@font-face {
+  /*
+   * The face everything else is set in: panels, sentences, numbers, and the
+   * plates on the canvas (pixi/fonts.ts carries the same stack).
+   *
+   * The monospace stack it replaces was the one thing in the interface that
+   * read as a web page rather than a keep.
+   *
+   * Lowercase only. Kingjola's capitals are swash initials that turn a label
+   * in capitals into a tangle, and its digits and most punctuation are empty
+   * glyphs -- used whole, every number in the HUD vanished. So `unicode-range`
+   * takes a to z from it and lets everything else fall through the stack to
+   * Pirata One, the blackletter the titles are already set in, which has all
+   * of them and reads as the same hand.
+   *
+   * Its x-height is a third of the em, so `size-adjust` enlarges it rather
+   * than every font-size in this file: the sizes stay the honest floor
+   * check-game-ui.mjs enforces, and the letters come out at the height those
+   * sizes promise.
+   */
+  font-family: "Kingjola";
+  src: url("/fonts/kingjola.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+0061-007A;
+  size-adjust: 170%;
+}
+
 /*
  * Shell Keep — the game skin.
  *
@@ -140,8 +169,7 @@
    * to read across a room, and legibility is the rule this file is held to.
    * The uppercase and the letter-spacing do the period work instead.
    */
-  --keep-font: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+  --keep-font: "Kingjola", "Pirata One", Georgia, serif;
 
   position: fixed;
   inset: 0;
@@ -2372,7 +2400,13 @@
   min-height: var(--keep-hit);
   padding: 0;
   font-size: var(--keep-text-xl);
-  /* A glyph, not a word: no tracking, and centred in its own square. */
+  /*
+   * A glyph, not a word: no tracking, and centred in its own square. Set in a
+   * system face, because the blackletter's plus and minus are drawn for a line
+   * of text and came out as specks in a square this size.
+   */
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
   letter-spacing: 0;
   line-height: 1;
 }
@@ -2618,6 +2652,6 @@
 .keep-assess-error { color: var(--keep-blood); }
 .keep-assess-list { list-style: none; margin: var(--keep-space) 0 0; padding: 0; }
 .keep-assess-list li { display: flex; flex-wrap: wrap; gap: var(--keep-space); align-items: baseline; margin-top: var(--keep-space); }
-.keep-assess-session { font-family: monospace; font-size: var(--keep-text-sm); opacity: 0.8; }
+.keep-assess-session { font-family: var(--keep-font); font-size: var(--keep-text-sm); opacity: 0.8; }
 .keep-assess-chip { border: 1px solid color-mix(in srgb, var(--keep-arcane) 55%, transparent); border-radius: 999px; padding: 0 6px; font-size: var(--keep-text-sm); }
 .keep-assess-age, .keep-assess-inferred { font-size: var(--keep-text-sm); opacity: 0.8; }
