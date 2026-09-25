@@ -2655,3 +2655,34 @@
 .keep-assess-session { font-family: var(--keep-font); font-size: var(--keep-text-sm); opacity: 0.8; }
 .keep-assess-chip { border: 1px solid color-mix(in srgb, var(--keep-arcane) 55%, transparent); border-radius: 999px; padding: 0 6px; font-size: var(--keep-text-sm); }
 .keep-assess-age, .keep-assess-inferred { font-size: var(--keep-text-sm); opacity: 0.8; }
+
+/*
+ * The pointer: a gauntlet rather than the system arrow.
+ *
+ * Only where there is a pointer to draw. A finger on glass has no cursor, and
+ * a rule that set one would do nothing there except load two files, so the
+ * whole block sits behind `pointer: fine`.
+ *
+ * The hotspot is the fingertip, (10, 1) in the 32-pixel drawing; see the
+ * comment in glove.svg. Anything that can be pressed wears the gilded one, so
+ * a control says so before it is clicked, and the system cursor is the
+ * fallback if the file does not arrive.
+ */
+@media (pointer: fine) {
+  .keep,
+  .keep * {
+    cursor: url("/game/ui/glove.svg") 10 1, default;
+  }
+
+  .keep :is(button, a[href], summary, label, select, [role="button"], [role="option"], input[type="range"], input[type="radio"], input[type="checkbox"]):not(:disabled) {
+    cursor: url("/game/ui/glove-hover.svg") 10 1, pointer;
+  }
+
+  .keep :is(input[type="text"], input[type="search"], input:not([type]), textarea) {
+    cursor: text;
+  }
+
+  .keep :disabled {
+    cursor: not-allowed;
+  }
+}
