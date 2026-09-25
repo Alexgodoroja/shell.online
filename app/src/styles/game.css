@@ -3145,19 +3145,18 @@
   white-space: nowrap;
 }
 
-/* While a recruit is on the way, the button glows with the beacon behind it. */
+/*
+ * While a recruit is on the way, the button burns with the beacon behind it.
+ *
+ * Held rather than pulsed: interface motion stays under the 300ms ceiling
+ * check-game-ui holds, and the beacon on the canvas is already doing the
+ * moving -- the button only has to say which state it is in.
+ */
 .keep-forge-train.is-training {
   border-color: #ffd27a;
-  animation: keep-forge-glow calc(1200ms * var(--keep-motion)) ease-in-out infinite alternate;
-}
-
-@keyframes keep-forge-glow {
-  from { box-shadow: 0 0 0 2px var(--keep-stone-dark), 0 0 calc(10px * var(--keep-scale)) rgb(255 210 122 / 40%); }
-  to { box-shadow: 0 0 0 2px var(--keep-stone-dark), 0 0 calc(34px * var(--keep-scale)) rgb(255 210 122 / 85%); }
-}
-
-.keep[data-motion="reduced"] .keep-forge-train.is-training {
-  animation: none;
+  box-shadow:
+    0 0 0 2px var(--keep-stone-dark),
+    0 0 calc(30px * var(--keep-scale)) rgb(255 210 122 / 80%);
 }
 
 /* The training form, in the sheet. */
