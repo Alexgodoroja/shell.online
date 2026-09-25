@@ -146,11 +146,20 @@ try {
     await until(() => browser.evaluate('Boolean(document.querySelector("dialog[open]"))'), "menu open");
   };
   const title = () => browser.evaluate('document.querySelector("dialog[open]")?.getAttribute("aria-label") ?? null');
+  // The game reads the pad once per animation frame, and a loaded machine can
+  // draw fewer than twenty frames a second. A press or a release shorter than a
+  // frame is never seen, so both are held for real frames as well as for time:
+  // a 50ms release between two presses read as one continuous hold.
+  const frames = (count) => browser.evaluate(`new Promise((done) => {
+    let left = ${count};
+    const step = () => (--left <= 0 ? done(true) : requestAnimationFrame(step));
+    requestAnimationFrame(step);
+  })`);
   const press = async (button, heldMs = 80) => {
     await browser.call((index) => { menuTest.buttons[index].pressed = true; }, button);
-    await delay(heldMs);
+    await Promise.all([delay(heldMs), frames(3)]);
     await browser.call((index) => { menuTest.buttons[index].pressed = false; }, button);
-    await delay(50);
+    await Promise.all([delay(50), frames(3)]);
   };
   const chooseOptions = async () => {
     await browser.call(() => {
