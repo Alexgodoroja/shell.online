@@ -154,7 +154,9 @@ try {
   };
   const chooseOptions = async () => {
     await browser.call(() => {
-      const item = document.querySelectorAll("[role=menuitem]")[6];
+      // By its label, not its position: the menu is shorter than it was.
+      const item = [...document.querySelectorAll("[role=menuitem]")]
+        .find((candidate) => candidate.querySelector(".keep-menu-label")?.textContent === "Options");
       item.focus();
       item.click();
     });
@@ -192,7 +194,7 @@ try {
   assert.deepEqual(await browser.evaluate("menuTest.transitions"), [true, false]);
 
   await open();
-  await browser.evaluate('document.querySelectorAll("[role=menuitem]")[6].focus()');
+  await browser.evaluate('[...document.querySelectorAll("[role=menuitem]")].find((item) => item.querySelector(".keep-menu-label")?.textContent === "Options").focus()');
   await press(0, 150);
   assert.equal(await title(), "Options", "held confirm must enter a pane only once");
   await press(15);
