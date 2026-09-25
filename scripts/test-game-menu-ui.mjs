@@ -59,8 +59,8 @@ function Fixture() {
     <button id="background">Background control</button>
     {paused && <PauseMenu
       onResume={() => change(false)} purse={{ marks: 0, owned: [] }}
-      characterClass="terminal" wearing="" livery="" shopOpen={false}
-      elixir={0} garrison={3} onBuy={() => {}} onWear={() => {}} onTravel={() => {}}
+      characterClass="terminal"
+      elixir={0} garrison={3}
       gathering={false} onGathering={() => {}}
       earned={{ sessions: 0, days: 0, machines: 0, mended: 0, made: 0 }} counted={false}
     />}

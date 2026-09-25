@@ -7,6 +7,7 @@ import { ActorLayer } from "./actors";
 import { Birds, Blows, Dust, loadEffects, Smoke } from "./ambience";
 import { Banners, OrderMark } from "./banners";
 import { McpFlowLayer } from "./mcp-flows";
+import { TrainingFx } from "./training";
 import type { McpFlow } from "../state/mcp-flows";
 import { loadSigils } from "./sigils";
 import type { Scene } from "./PixiStage";
@@ -75,6 +76,25 @@ export interface KeepHandle {
   still(stop: boolean): void;
   /** Rides the camera to a holding, named by id. See the road book. */
   lookAt(garrisonId: string): void;
+  /**
+   * Rides the camera to one figure and opens its card, as a click on it would.
+   * The HUD's list of the player's own sessions is how that is reached.
+   */
+  follow(actorId: string): void;
+  /**
+   * Where the Forge's training button belongs on the canvas, every frame, and
+   * how large it should be drawn at this zoom. `undefined` when the Forge is
+   * off the screen. Written straight to the button's style by the route, for
+   * the same reason `onTrack` is: React at frame rate is a heavy way to move
+   * one box.
+   */
+  onForge?: (at: { x: number; y: number; scale: number } | undefined) => void;
+  /** An order to train has been sent; the Forge lights up until it arrives. */
+  train(): void;
+  /** The order failed; the Forge goes dark again. */
+  cancelTraining(): void;
+  /** A trained soldier has joined the field. */
+  onTrained?: (actorId: string) => void;
 }
 
 /**
@@ -171,6 +191,13 @@ export async function buildKeepScene(
   const smoke = new Smoke(things, fx["fx-smoke_01"]);
   const dust = new Dust(things, fx["fx-smoke_01"]);
   const blows = new Blows(things, fx, numberFor);
+  /* The training yard is the Forge, where things that did not exist are made. */
+  const forge = GARRISONS.find((holding) => holding.id === "forge") ?? GARRISONS[0];
+  /*
+   * On the world rather than among the things: that layer is dusk-tinted, and
+   * a light tinted towards evening is a light nobody can see.
+   */
+  const training = new TrainingFx(world, fx, { x: forge.x, y: forge.y + 1 });
 
   handle.select = (id) => {
     selected = id;
@@ -192,7 +219,10 @@ export async function buildKeepScene(
      * legible, so the setting takes the flicker and leaves the light.
      */
     lanterns.still(stop);
+    training.still(stop);
   };
+  handle.train = () => training.begin(sim);
+  handle.cancelTraining = () => training.cancel();
   handle.lookAt = (garrisonId) => {
     const garrison = GARRISONS.find((holding) => holding.id === garrisonId);
     if (!garrison) return;
@@ -210,6 +240,21 @@ export async function buildKeepScene(
       time: 600,
       ease: "easeInOutSine",
     });
+  };
+
+  handle.follow = (actorId) => {
+    const actor = sim.actors.find((one) => one.id === actorId);
+    if (!actor) return;
+    const { x, y } = toScreen(actor.x, actor.y);
+    const scale = Math.max(viewport.scale.x, settled());
+    viewport.animate({
+      position: { x, y: y - headroom(app.screen.height) / scale },
+      scale,
+      time: 600,
+      ease: "easeInOutSine",
+    });
+    selected = actor.id;
+    handle.onPick?.(actor);
   };
 
   /*
@@ -364,6 +409,25 @@ export async function buildKeepScene(
     handle.onTrack(viewport.toScreen(world.x, world.y));
   };
 
+  /*
+   * The Forge's button, placed over the front of its yard.
+   *
+   * Sized with the zoom, so it reads as a thing standing at the Forge rather
+   * than a sticker on the glass -- and never below the size a thumb can hit,
+   * which is the floor the rest of the interface holds.
+   */
+  const forgeFront = toScreen(forge.x, forge.y + 2.5);
+  const placeForge = () => {
+    if (!handle.onForge) return;
+    const at = viewport.toScreen(forgeFront.x, forgeFront.y);
+    const margin = 40;
+    if (at.x < -margin || at.y < -margin || at.x > app.screen.width + margin || at.y > app.screen.height + margin) {
+      handle.onForge(undefined);
+      return;
+    }
+    handle.onForge({ x: at.x, y: at.y, scale: Math.min(1.5, Math.max(0.85, viewport.scale.x * 1.4)) });
+  };
+
   let found = false;
   const findYou = () => {
     if (found) return;
@@ -460,6 +524,7 @@ export async function buildKeepScene(
       findYou();
       heldCamps();
       track();
+      placeForge();
       /* Only the camps somebody is actually holding are standing. */
       for (const [key, camp] of camps) camp.visible = held.has(key);
       companies.sync(sim);
@@ -467,6 +532,8 @@ export async function buildKeepScene(
       actors.sync(sim, selected);
       mcpFlows.sync(handle.mcpFlows?.() ?? [], sim.actors, Date.now());
       blows.sync(sim);
+      const arrived = training.tick(sim, deltaMs);
+      if (arrived) handle.onTrained?.(arrived);
       lanterns.tick(deltaMs);
       birds.tick(deltaMs);
       smoke.tick(deltaMs);
@@ -485,6 +552,7 @@ export async function buildKeepScene(
       smoke.destroy();
       dust.destroy();
       blows.destroy();
+      training.destroy();
     },
   };
 }

@@ -21,7 +21,7 @@ import { overlayScale } from "../engine/zoom";
  */
 
 /** Particle textures, vendored from Kenney's CC0 pack. See the notices file. */
-const FX_TEXTURES = ["fx-smoke_01", "fx-star_04", "fx-flare_01", "fx-spark_04", "fx-magic_05"];
+const FX_TEXTURES = ["fx-smoke_01", "fx-star_04", "fx-flare_01", "fx-spark_04", "fx-magic_05", "fx-light_01", "fx-circle_05"];
 
 export async function loadEffects(): Promise<Record<string, Texture>> {
   const loaded: Record<string, Texture> = {};
