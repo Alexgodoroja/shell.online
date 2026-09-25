@@ -6,6 +6,7 @@ import { depthOf, TILE_H, toScreen } from "../world/iso";
 import type { Loaded } from "./scene";
 import type { Actor, Sim } from "../world/sim";
 import { ACTOR_SCALE } from "../world/scale";
+import { overlayScale } from "../engine/zoom";
 
 /**
  * The people on the map, and the things that got in.
@@ -99,6 +100,26 @@ function lift(id: string): number {
  */
 const HERO_LIFT = 6 * 36 + 24;
 
+/**
+ * A health bar, in the figure's own pixels before the zoom enlarges it.
+ *
+ * Wide and thick enough to read at a glance: the old bar was twenty-six by
+ * four, which zoomed out was a smudge. Enemies bleed red and the garrison's
+ * own green, so which side is losing reads before the length of either does.
+ * Drawn upward from its anchor, so enlarging it lifts it clear of the head
+ * rather than growing down into the face.
+ */
+const BAR_W = 56;
+const BAR_H = 10;
+function drawBar(bar: Graphics, fraction: number, enemy: boolean): void {
+  bar.clear();
+  bar.rect(-BAR_W / 2, -BAR_H, BAR_W, BAR_H).fill({ color: 0x1a1008, alpha: 0.9 });
+  bar
+    .rect(-BAR_W / 2 + 2, -BAR_H + 2, (BAR_W - 4) * Math.max(0, Math.min(1, fraction)), BAR_H - 4)
+    .fill({ color: enemy ? 0xe0453a : 0x8fd05a });
+  bar.rect(-BAR_W / 2, -BAR_H, BAR_W, BAR_H).stroke({ color: 0xf0d9a8, width: 1.5, alpha: 0.7 });
+}
+
 interface Piece {
   root: Container;
   /**
@@ -150,6 +171,8 @@ export class ActorLayer {
 
   /** The last zoom the plates were sized for; see `zoomed`. */
   private plateScale = 1;
+  /** And the health bars, which grow against the zoom as well. */
+  private barScale = 1;
 
   /** Called when a skin or a livery is bought or changed in the shop. */
   wear(skin: number, livery: number): void {
@@ -183,6 +206,7 @@ export class ActorLayer {
      * across a phone, and a map behind its own labels is not a map.
      */
     this.plateScale = Math.min(ceiling, Math.max(0.75, 1 / scale));
+    this.barScale = overlayScale(scale, ceiling);
     /*
      * Every board is shown at every zoom the wheel allows, heroes and soldiers
      * alike. A dozen of them over one camp do interleave; the answer to that is
@@ -190,6 +214,7 @@ export class ActorLayer {
      * exactly the distance you need them.
      */
     for (const piece of this.pieces.values()) {
+      piece.bar.scale.set(this.barScale);
       if (!piece.plate) continue;
       piece.plate.root.scale.set(this.plateScale);
     }
@@ -219,6 +244,7 @@ export class ActorLayer {
       /* Health over the creature, shown only once something is off it. */
       const hurt = new Graphics();
       hurt.position.set(0, -24 * UNMADE);
+      hurt.scale.set(this.barScale);
       hurt.visible = false;
       root.addChild(hurt);
 
@@ -261,6 +287,7 @@ export class ActorLayer {
      */
     const bar = new Graphics();
     bar.position.set(0, -sprite.height - 4);
+    bar.scale.set(this.barScale);
     bar.visible = false;
     if (actor.role !== "hero") root.addChild(bar);
 
@@ -433,13 +460,7 @@ export class ActorLayer {
         piece.lastHp = actor.hp;
         const hurt = actor.hp < actor.maxHp && actor.role !== "hero";
         piece.bar.visible = hurt;
-        if (hurt) {
-          piece.bar.clear();
-          piece.bar.rect(-13, 0, 26, 4).fill({ color: 0x1a1008, alpha: 0.85 });
-          piece.bar
-            .rect(-12, 1, 24 * Math.max(0, actor.hp / actor.maxHp), 2)
-            .fill({ color: actor.side === "unmade" ? 0x48d6c0 : 0x8fd05a });
-        }
+        if (hurt) drawBar(piece.bar, actor.hp / actor.maxHp, actor.side === "unmade");
       }
 
       if (piece.plate) {

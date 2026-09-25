@@ -76,16 +76,24 @@ export interface KeepHandle {
   lookAt(garrisonId: string): void;
 }
 
-/** The style of a floating number. Built here so Blows stays about pooling. */
+/**
+ * The style of a floating number. Built here so Blows stays about pooling.
+ *
+ * Large, and larger again zoomed out (see Blows.zoomed). At twenty pixels a
+ * number was only legible close enough in that the fight filled the screen,
+ * which is not where anybody watches a fight from.
+ */
 function numberFor(text: string, kind: Mark["kind"]): Container {
   const node = new Text({
     text,
+    /* Rasterised at twice the size, so the enlargement does not blur it. */
+    resolution: 2,
     style: {
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 20,
-      fontWeight: "700",
-      fill: kind === "damage" ? 0xff8fb0 : 0xe8c65a,
-      stroke: { color: 0x1a1008, width: 5 },
+      fontSize: 44,
+      fontWeight: "900",
+      fill: kind === "damage" ? 0xff5a4f : 0xffd84a,
+      stroke: { color: 0x1a1008, width: 9 },
     },
   });
   node.anchor.set(0.5);
@@ -395,6 +403,7 @@ export async function buildKeepScene(
       sign.visible = left >= 8 && top >= 8 && right <= app.screen.width - 8 && bottom <= app.screen.height - 8;
     }
     actors.zoomed(viewport.scale.x, plateCeiling(app.screen.width));
+    blows.zoomed(viewport.scale.x, plateCeiling(app.screen.width));
     /*
      * The controls are told from here rather than from their own listener:
      * this already runs on every zoom and every frame of a drag, and a second
